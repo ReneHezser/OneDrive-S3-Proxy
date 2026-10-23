@@ -7,6 +7,7 @@ public interface IOneDriveStore
     Task<bool> BucketExistsAsync(string bucket, CancellationToken cancellationToken);
     Task DeleteBucketAsync(string bucket, CancellationToken cancellationToken);
     Task<IReadOnlyList<ObjectInfo>> ListObjectsAsync(string bucket, CancellationToken cancellationToken);
+    Task<ObjectListing> ListObjectsAsync(string bucket, string prefix, string? delimiter, CancellationToken cancellationToken);
     Task<ObjectInfo> PutObjectAsync(string bucket, string key, Stream content, long? length, CancellationToken cancellationToken);
     Task<GraphDownload> GetObjectAsync(string bucket, string key, string? range, CancellationToken cancellationToken);
     Task<ObjectInfo> GetObjectInfoAsync(string bucket, string key, CancellationToken cancellationToken);

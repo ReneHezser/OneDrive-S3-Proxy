@@ -148,29 +148,12 @@ public static partial class S3Endpoints
         var lowerBound = isV2
             ? MaxKey(continuation, startAfter)
             : marker;
-        var all = (await store.ListObjectsAsync(bucket, cancellationToken))
-            .Where(item => item.Key.StartsWith(prefix, StringComparison.Ordinal))
-            .ToList();
+        var listing = maxKeys == 0
+            ? new ObjectListing([], [])
+            : await store.ListObjectsAsync(bucket, prefix, delimiter, cancellationToken);
 
-        var commonPrefixes = new SortedSet<string>(StringComparer.Ordinal);
-        var visibleObjects = new List<ObjectInfo>();
-        foreach (var item in all)
-        {
-            if (!string.IsNullOrEmpty(delimiter))
-            {
-                var delimiterIndex = item.Key.IndexOf(delimiter, prefix.Length, StringComparison.Ordinal);
-                if (delimiterIndex >= 0)
-                {
-                    commonPrefixes.Add(item.Key[..(delimiterIndex + delimiter.Length)]);
-                    continue;
-                }
-            }
-
-            visibleObjects.Add(item);
-        }
-
-        var entries = visibleObjects.Select(item => new ListEntry(item.Key, item, null))
-            .Concat(commonPrefixes.Select(item => new ListEntry(item, null, item)))
+        var entries = listing.Objects.Select(item => new ListEntry(item.Key, item, null))
+            .Concat(listing.CommonPrefixes.Select(item => new ListEntry(item, null, item)))
             .OrderBy(item => item.Key, StringComparer.Ordinal)
             .Where(item => lowerBound is null || string.CompareOrdinal(item.Key, lowerBound) > 0)
             .ToList();

@@ -356,6 +356,106 @@ public sealed class GraphStoreContractTests
     }
 
     [Fact]
+    public async Task ListObjects_SystemBackupPrefixDoesNotVisitVolumeBlocks()
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backupstore/system-backups/backup-a/config.json", [1, 2, 3]);
+        for (var index = 0; index < 256; index++)
+        {
+            handler.AddDirectObject("bucket", $"backupstore/volumes/{index:x4}/blocks/aa/bb/data.blk", [1]);
+        }
+
+        var store = CreateStore(handler, handler);
+        var listing = await store.ListObjectsAsync("bucket", "backupstore/system-backups/", null, CancellationToken.None);
+
+        Assert.Equal("backupstore/system-backups/backup-a/config.json", Assert.Single(listing.Objects).Key);
+        Assert.Empty(listing.CommonPrefixes);
+        Assert.Equal(2, handler.Requests.Count(request => request.Uri.AbsolutePath.EndsWith(":/children", StringComparison.Ordinal)));
+        Assert.DoesNotContain(handler.Requests, request => request.Uri.AbsolutePath.Contains("/volumes", StringComparison.Ordinal));
+        Assert.Equal(0, handler.ContentDownloads);
+    }
+
+    [Theory]
+    [InlineData("", null)]
+    [InlineData("", "/")]
+    [InlineData("logs/", null)]
+    [InlineData("logs/", "/")]
+    [InlineData("logs/20", "/")]
+    [InlineData("logs/2026/", "/")]
+    [InlineData("logs/2026/a", null)]
+    [InlineData("logs/2026/a.txt/", "/")]
+    [InlineData("logs/v1", "--")]
+    [InlineData("logs/", "26/")]
+    [InlineData("logs/", "2026/a")]
+    [InlineData("logs/", ".")]
+    [InlineData("log", "/")]
+    [InlineData("LOGS/", "/")]
+    [InlineData("missing/", "/")]
+    [InlineData("logs//", "/")]
+    public async Task ListObjects_PrefixAndDelimiterMatchObjectKeySemantics(string prefix, string? delimiter)
+    {
+        string[] keys =
+        [
+            "logs/2026/a.txt", "logs/2026/b.txt", "logs/2027/a.txt",
+            "logs/v1--alpha/a.txt", "logs/v1--beta/b.txt", "logs-extra/root.txt", "plain.txt"
+        ];
+        var handler = new ListingHandler();
+        foreach (var key in keys)
+        {
+            handler.AddDirectObject("bucket", key, [1]);
+        }
+
+        handler.AddEmptyFolder("bucket", "empty/nested");
+        handler.AddEmptyFolder("bucket", "logs/2025/empty");
+        var expected = ObjectListing.FromObjects(
+            keys.Select(key => new ObjectInfo(key, 1, DateTimeOffset.UtcNow, "\"etag\"")),
+            prefix,
+            delimiter);
+        var store = CreateStore(handler, handler);
+
+        var actual = await store.ListObjectsAsync("bucket", prefix, delimiter, CancellationToken.None);
+
+        Assert.Equal(expected.Objects.Select(item => item.Key), actual.Objects.Select(item => item.Key));
+        Assert.Equal(expected.CommonPrefixes, actual.CommonPrefixes);
+        Assert.Equal(0, handler.ContentDownloads);
+    }
+
+    [Fact]
+    public async Task ListObjects_FollowsGraphPages()
+    {
+        var handler = new ListingHandler { PageSize = 1 };
+        foreach (var key in new[] { "a.txt", "b.txt", "c.txt" })
+        {
+            handler.AddDirectObject("bucket", key, [1]);
+        }
+
+        var store = CreateStore(handler, handler);
+        var listing = await store.ListObjectsAsync("bucket", string.Empty, null, CancellationToken.None);
+
+        Assert.Equal(["a.txt", "b.txt", "c.txt"], listing.Objects.Select(item => item.Key));
+        Assert.Equal(3, handler.Requests.Count(request => request.Uri.AbsolutePath.EndsWith(":/children", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task ListObjects_DelimiterStopsAfterFindingOneDescendantFile()
+    {
+        var handler = new ListingHandler { PageSize = 1 };
+        for (var index = 0; index < 256; index++)
+        {
+            handler.AddDirectObject("bucket", $"logs/{index:x4}/blocks/data.blk", [1]);
+        }
+
+        var store = CreateStore(handler, handler);
+        var listing = await store.ListObjectsAsync("bucket", string.Empty, "/", CancellationToken.None);
+
+        Assert.Empty(listing.Objects);
+        Assert.Equal(["logs/"], listing.CommonPrefixes);
+        Assert.Equal(4, handler.Requests.Count(request => request.Uri.AbsolutePath.EndsWith(":/children", StringComparison.Ordinal)));
+        Assert.DoesNotContain(handler.Requests, request => request.Uri.Query.Contains("$skiptoken", StringComparison.Ordinal));
+        Assert.Equal(0, handler.ContentDownloads);
+    }
+
+    [Fact]
     public async Task PutObjectState_RetriesTransientGraphFailures()
     {
         var handler = new FlakyStateHandler(failures: 2);
@@ -628,6 +728,7 @@ public sealed class GraphStoreContractTests
         }
 
         public int ContentDownloads => _contentDownloads;
+        public int PageSize { get; init; } = int.MaxValue;
         public int UploadSessions { get; private set; }
         public Action? BeforeUpload { get; set; }
 
@@ -635,6 +736,15 @@ public sealed class GraphStoreContractTests
 
         public void AddDirectObject(string bucket, string key, byte[] content) =>
             AddFile($"S3/{bucket}/{key}", content, content.Length);
+
+        public void AddEmptyFolder(string bucket, string key)
+        {
+            var segments = $"S3/{bucket}/{key}".Split('/');
+            for (var length = 1; length <= segments.Length; length++)
+            {
+                _items.TryAdd(string.Join('/', segments[..length]), (true, null, 0));
+            }
+        }
 
         protected override async Task<HttpResponseMessage> RespondAsync(
             HttpRequestMessage request,
@@ -689,7 +799,7 @@ public sealed class GraphStoreContractTests
                     return Json(HttpStatusCode.Created, Describe(path, _items[path]));
                 }
 
-                return Children(parent);
+                return Children(parent, request.RequestUri);
             }
 
             if (rest.EndsWith(":/createUploadSession", StringComparison.Ordinal) ||
@@ -780,7 +890,7 @@ public sealed class GraphStoreContractTests
             _items[path] = (false, content, size);
         }
 
-        private HttpResponseMessage Children(string folder)
+        private HttpResponseMessage Children(string folder, Uri requestUri)
         {
             if (!_items.TryGetValue(folder, out var parent) || !parent.IsFolder)
             {
@@ -788,12 +898,24 @@ public sealed class GraphStoreContractTests
             }
 
             var prefix = $"{folder}/";
+            var skipToken = System.Text.RegularExpressions.Regex.Match(requestUri.Query, @"(?:\?|&)\$skiptoken=(\d+)");
+            var skip = skipToken.Success ? int.Parse(skipToken.Groups[1].Value) : 0;
             var children = _items
                 .Where(pair => pair.Key.StartsWith(prefix, StringComparison.Ordinal) &&
                                !pair.Key[prefix.Length..].Contains('/'))
+                .OrderBy(pair => pair.Key, StringComparer.Ordinal)
                 .Select(pair => Describe(pair.Key, pair.Value))
                 .ToList();
-            return Json(HttpStatusCode.OK, new { value = children });
+            var page = new Dictionary<string, object>
+            {
+                ["value"] = children.Skip(skip).Take(PageSize).ToList()
+            };
+            if (children.Count - skip > PageSize)
+            {
+                page["@odata.nextLink"] = $"{requestUri.GetLeftPart(UriPartial.Path)}?$skiptoken={skip + PageSize}";
+            }
+
+            return Json(HttpStatusCode.OK, page);
         }
 
         private static object Describe(string path, (bool IsFolder, byte[]? Content, long Size) item)

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
@@ -63,7 +64,14 @@ public sealed class OneDriveStore(
         await DeletePathAsync(MultipartBucketPath(bucket), ignoreMissing: true, cancellationToken);
     }
 
-    public async Task<IReadOnlyList<ObjectInfo>> ListObjectsAsync(string bucket, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<ObjectInfo>> ListObjectsAsync(string bucket, CancellationToken cancellationToken) =>
+        (await ListObjectsAsync(bucket, string.Empty, null, cancellationToken)).Objects;
+
+    public async Task<ObjectListing> ListObjectsAsync(
+        string bucket,
+        string prefix,
+        string? delimiter,
+        CancellationToken cancellationToken)
     {
         if (!await BucketExistsAsync(bucket, cancellationToken))
         {
@@ -71,25 +79,90 @@ public sealed class OneDriveStore(
         }
 
         var results = new Dictionary<string, ObjectInfo>(StringComparer.Ordinal);
+        var commonPrefixes = new SortedSet<string>(StringComparer.Ordinal);
         var folders = new Queue<(string Path, string Prefix)>();
-        folders.Enqueue((BucketPath(bucket), string.Empty));
+        var slash = prefix.LastIndexOf('/');
+        if (slash >= 0)
+        {
+            var folderKey = prefix[..slash];
+            var start = await TryResolveKeyPathAsync(bucket, folderKey, cancellationToken);
+            if (start is null || start.Value.Item.Folder is null)
+            {
+                return new ObjectListing([], []);
+            }
+
+            folders.Enqueue((start.Value.Path, folderKey));
+        }
+        else
+        {
+            folders.Enqueue((BucketPath(bucket), string.Empty));
+        }
+
         while (folders.TryDequeue(out var folder))
         {
-            foreach (var item in await GetChildrenAsync(folder.Path, cancellationToken))
+            await foreach (var item in EnumerateChildrenAsync(folder.Path, cancellationToken))
             {
                 var key = string.IsNullOrEmpty(folder.Prefix) ? item.Name : $"{folder.Prefix}/{item.Name}";
                 if (item.Folder is not null)
                 {
+                    var folderPrefix = key + "/";
+                    if (!folderPrefix.StartsWith(prefix, StringComparison.Ordinal) &&
+                        !prefix.StartsWith(folderPrefix, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    var index = !string.IsNullOrEmpty(delimiter) && folderPrefix.StartsWith(prefix, StringComparison.Ordinal)
+                        ? folderPrefix.IndexOf(delimiter, prefix.Length, StringComparison.Ordinal)
+                        : -1;
+                    if (index >= 0)
+                    {
+                        var commonPrefix = folderPrefix[..(index + delimiter!.Length)];
+                        if (!commonPrefixes.Contains(commonPrefix) &&
+                            await ContainsObjectsAsync($"{folder.Path}/{item.Name}", cancellationToken))
+                        {
+                            commonPrefixes.Add(commonPrefix);
+                        }
+
+                        continue;
+                    }
+
                     folders.Enqueue(($"{folder.Path}/{item.Name}", key));
                 }
-                else
+                else if (key.StartsWith(prefix, StringComparison.Ordinal))
                 {
-                    results[key] = ToObjectInfo(key, item);
+                    var index = string.IsNullOrEmpty(delimiter)
+                        ? -1
+                        : key.IndexOf(delimiter, prefix.Length, StringComparison.Ordinal);
+                    if (index >= 0)
+                    {
+                        commonPrefixes.Add(key[..(index + delimiter!.Length)]);
+                    }
+                    else
+                    {
+                        results[key] = ToObjectInfo(key, item);
+                    }
                 }
             }
         }
 
-        return results.Values.OrderBy(item => item.Key, StringComparer.Ordinal).ToList();
+        return new ObjectListing(
+            results.Values.OrderBy(item => item.Key, StringComparer.Ordinal).ToList(),
+            commonPrefixes.ToList());
+    }
+
+    private async Task<bool> ContainsObjectsAsync(string path, CancellationToken cancellationToken)
+    {
+        await foreach (var item in EnumerateChildrenAsync(path, cancellationToken))
+        {
+            if (item.Folder is null ||
+                await ContainsObjectsAsync($"{path}/{item.Name}", cancellationToken))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public async Task<ObjectInfo> PutObjectAsync(
@@ -139,7 +212,7 @@ public sealed class OneDriveStore(
 
     public async Task DeleteObjectAsync(string bucket, string key, CancellationToken cancellationToken)
     {
-        if (await TryResolveDirectObjectAsync(bucket, key, cancellationToken) is { } direct)
+        if (await TryResolveKeyPathAsync(bucket, key, cancellationToken) is { } direct && direct.Item.Folder is null)
         {
             await DeletePathAsync(direct.Path, ignoreMissing: true, cancellationToken, ItemIdPath(direct.Item.Id));
         }
@@ -779,6 +852,18 @@ public sealed class OneDriveStore(
     private async Task<List<DriveItem>> GetChildrenAsync(string path, CancellationToken cancellationToken)
     {
         var items = new List<DriveItem>();
+        await foreach (var item in EnumerateChildrenAsync(path, cancellationToken))
+        {
+            items.Add(item);
+        }
+
+        return items;
+    }
+
+    private async IAsyncEnumerable<DriveItem> EnumerateChildrenAsync(
+        string path,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         string? next = $"{ItemPath(path)}:/children?$select=id,name,size,eTag,createdDateTime,lastModifiedDateTime,folder&$top=200";
         while (next is not null)
         {
@@ -786,11 +871,13 @@ public sealed class OneDriveStore(
             await EnsureSuccessAsync(response, cancellationToken);
             var page = await response.Content.ReadFromJsonAsync<DriveItemCollection>(cancellationToken)
                 ?? throw new GraphStoreException(502, "Microsoft Graph returned an empty collection response.");
-            items.AddRange(page.Value);
+            foreach (var item in page.Value)
+            {
+                yield return item;
+            }
+
             next = page.NextLink;
         }
-
-        return items;
     }
 
     private async Task<DriveItem> GetItemAsync(string path, CancellationToken cancellationToken) =>
@@ -802,7 +889,7 @@ public sealed class OneDriveStore(
         string key,
         CancellationToken cancellationToken)
     {
-        if (await TryResolveDirectObjectAsync(bucket, key, cancellationToken) is { } direct)
+        if (await TryResolveKeyPathAsync(bucket, key, cancellationToken) is { } direct && direct.Item.Folder is null)
         {
             return direct;
         }
@@ -810,7 +897,7 @@ public sealed class OneDriveStore(
         throw new GraphStoreException(404, "The specified object does not exist.", "NoSuchKey");
     }
 
-    private async Task<(string Path, DriveItem Item)?> TryResolveDirectObjectAsync(
+    private async Task<(string Path, DriveItem Item)?> TryResolveKeyPathAsync(
         string bucket,
         string key,
         CancellationToken cancellationToken)
@@ -836,7 +923,7 @@ public sealed class OneDriveStore(
             }
         }
 
-        return item is not null && item.Folder is null ? (path, item) : null;
+        return item is not null ? (path, item) : null;
     }
 
     private async Task<DriveItem?> TryGetItemAsync(string path, CancellationToken cancellationToken)
