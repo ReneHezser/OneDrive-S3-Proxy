@@ -39,7 +39,7 @@ public sealed class GraphStoreContractTests
         Assert.Equal("destination/key", copied.Key);
         Assert.Equal(2, handler.MonitorRequests);
         Assert.DoesNotContain(handler.Requests, request => request.Method == HttpMethod.Delete.Method);
-        var copyRequest = Assert.Single(handler.Requests.Where(request => request.Method == HttpMethod.Post.Method));
+        var copyRequest = Assert.Single(handler.Requests, request => request.Method == HttpMethod.Post.Method);
         Assert.Contains("conflictBehavior=replace", copyRequest.Uri.Query);
     }
 
