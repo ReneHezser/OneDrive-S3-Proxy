@@ -126,8 +126,8 @@ test suite on pushes to `main` and on pull requests, including when a PR is merg
 Closing a PR without merging skips the jobs. Changes that only touch files under
 `.github/` (workflows, Dependabot configuration) do not trigger it; a change that also
 touches any other file does. The Docker image is built only after tests pass. Pull
-request updates (including Dependabot and fork PRs), direct pushes, and all manual
-runs build without logging in or publishing. If you require the `Test` and `Build and publish
+request updates (including Dependabot and fork PRs), direct pushes, and manual
+runs on branches other than `main` build without logging in or publishing. If you require the `Test` and `Build and publish
 image` checks in branch protection, a PR that only changes `.github/` files will wait
 on checks that never run, so temporarily adjust the rule or merge it as an admin.
 
@@ -141,18 +141,21 @@ the workflow with `workflow_dispatch` enabled. Alternatively, use the GitHub CLI
 gh workflow run ci.yml --ref <branch-name>
 ```
 
-Manual runs on every branch, including `main`, run the tests and Docker build
-without publishing an image.
+Manual runs on `main` run the tests, build, and publish the image using the current
+changelog version. For example, `gh workflow run ci.yml --ref main` publishes
+`0.1.3` when that is the latest release heading. Manual runs on other branches
+run the tests and Docker build without publishing an image.
 
-Images are published only when a pull request is **merged into `main`**, using
-the PR's merge commit for checkout, image revision, and SHA tag. Direct pushes to
-`main`, open PR updates, unmerged PR closures, and manual CI runs never publish.
+Images are published when a pull request is **merged into `main`** or CI is
+**run manually on `main`**. PR merges use the merge commit for checkout, image
+revision, and SHA tag; manual runs use the selected `main` commit. Direct pushes
+to `main`, open PR updates, and unmerged PR closures never publish.
 Publishing uses the workflow's `GITHUB_TOKEN` for GitHub Container Registry (GHCR);
 no registry password secret is required. The image
 name is `ghcr.io/<owner>/<repository>`, converted to lowercase, with these tags:
 
 - `0.1.0`: the first released version heading in [CHANGELOG.md](CHANGELOG.md).
-- `latest`: the most recent successful merged-PR publish.
+- `latest`: the most recent successful merged-PR or manual `main` publish.
 - `sha-<full-commit-sha>`: a commit-specific tag for traceability.
 
 Merge publishing uses `pull_request_target` only for closed PRs targeting `main`,
@@ -177,7 +180,7 @@ To change the version tag, add a new release heading and its release notes befor
 merging to `main`. For example, `## [0.2.0] - 2026-11-01` produces
 `ghcr.io/<owner>/<repository>:0.2.0`.
 
-Version and `latest` tags move on each merged-PR publish, even if the changelog
+Version and `latest` tags move on each merged-PR or manual `main` publish, even if the changelog
 version has not changed. Use an image digest for immutable deployments; the SHA tag
 identifies the source commit but can also be overwritten by a workflow rerun.
 This workflow does not create Git tags or GitHub Releases. If release-only images

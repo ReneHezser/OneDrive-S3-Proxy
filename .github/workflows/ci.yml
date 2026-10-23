@@ -73,7 +73,7 @@ jobs:
       - name: Determine publishing policy
         id: publish-policy
         env:
-          SHOULD_PUBLISH: ${{ github.event_name == 'pull_request_target' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+          SHOULD_PUBLISH: ${{ (github.event_name == 'pull_request_target' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
         run: echo "publish=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
 
       - name: Read image version from changelog
@@ -107,7 +107,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build image and publish only for a merged PR
+      - name: Build image and publish for a merged PR or manual main run
         uses: docker/build-push-action@v7
         with:
           context: .
