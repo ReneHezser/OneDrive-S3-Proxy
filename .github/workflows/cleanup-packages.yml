@@ -1,0 +1,43 @@
+name: Cleanup SHA-only packages
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cleanup-packages
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Delete SHA-only image versions
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       (github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'workflow_dispatch'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out trusted source
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Delete versions with only a commit SHA tag
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const cleanup = require('./.github/scripts/cleanup-packages.cjs');
+            await cleanup({ github, context, core });

@@ -26,6 +26,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Test package cleanup
+        run: node --test .github/scripts/cleanup-packages.test.cjs
+
       - name: Set up .NET
         uses: actions/setup-dotnet@v6
         with:
