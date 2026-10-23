@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-10-23
+
+### Fixed
+
+- Resolve the folder portion of S3 listing prefixes directly and traverse only
+  matching branches, avoiding scans of unrelated volume-block directories when
+  Longhorn lists system backups.
+- Stop searching delimiter-grouped subtrees after finding one file, while preserving
+  empty-folder handling, S3 pagination, and Microsoft Graph paging.
+- Skip object enumeration for listings with `max-keys=0`.
+
 ## [0.1.3] - 2026-10-23
 
 ### Changed

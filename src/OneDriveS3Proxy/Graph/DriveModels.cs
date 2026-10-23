@@ -7,6 +7,31 @@ public sealed record BucketInfo(string Name, DateTimeOffset Created);
 
 public sealed record ObjectInfo(string Key, long Size, DateTimeOffset LastModified, string ETag);
 
+public sealed record ObjectListing(IReadOnlyList<ObjectInfo> Objects, IReadOnlyList<string> CommonPrefixes)
+{
+    public static ObjectListing FromObjects(IEnumerable<ObjectInfo> objects, string prefix, string? delimiter)
+    {
+        var visible = new List<ObjectInfo>();
+        var commonPrefixes = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var item in objects.Where(item => item.Key.StartsWith(prefix, StringComparison.Ordinal)))
+        {
+            var index = string.IsNullOrEmpty(delimiter)
+                ? -1
+                : item.Key.IndexOf(delimiter, prefix.Length, StringComparison.Ordinal);
+            if (index >= 0)
+            {
+                commonPrefixes.Add(item.Key[..(index + delimiter!.Length)]);
+            }
+            else
+            {
+                visible.Add(item);
+            }
+        }
+
+        return new ObjectListing(visible.OrderBy(item => item.Key, StringComparer.Ordinal).ToList(), commonPrefixes.ToList());
+    }
+}
+
 public sealed record ObjectState
 {
     public string? Key { get; init; }

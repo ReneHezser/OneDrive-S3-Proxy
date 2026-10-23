@@ -306,10 +306,12 @@ Use `onedrive-s3-backup-target` as the credential secret. The trailing slash, re
 endpoint.
 
 Standard Longhorn volume backups and its multipart-capable single-file upload path are
-supported within the configured object-size limit. Object listing walks the proxy's
-OneDrive object folders (and any legacy key-shaped objects) and caches the key of each
-object in memory, so repeated listings of large backupstores need far fewer Graph calls,
-but the first listing may still be constrained by Microsoft Graph throttling and time.
+supported within the configured object-size limit. Object listing resolves the folder
+portion of the requested prefix directly and traverses only matching branches, so listing
+system backups does not scan unrelated volume-block directories. Delimiter listings
+stop searching a grouped subtree after finding one file; empty folders are not exposed
+as S3 common prefixes. Listings still require live Graph requests, and broad listings or
+sustained Microsoft Graph throttling can still exceed a client's timeout.
 
 References:
 

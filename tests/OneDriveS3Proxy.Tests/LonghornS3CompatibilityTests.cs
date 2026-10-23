@@ -139,6 +139,9 @@ internal sealed class InMemoryOneDriveStore : IOneDriveStore
             .OrderBy(item => item.Key, StringComparer.Ordinal)
             .ToList());
 
+    public async Task<ObjectListing> ListObjectsAsync(string bucket, string prefix, string? delimiter, CancellationToken cancellationToken) =>
+        ObjectListing.FromObjects(await ListObjectsAsync(bucket, cancellationToken), prefix, delimiter);
+
     public async Task<ObjectInfo> PutObjectAsync(
         string bucket,
         string key,
