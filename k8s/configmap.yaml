@@ -7,5 +7,6 @@ data:
   Entra__ClientId: "00000000-0000-0000-0000-000000000000"
   OneDrive__UserId: "user@contoso.com"
   OneDrive__RootFolder: "S3"
+  S3__URL: "http://+:9000"
   S3__Region: "us-east-1"
   S3__MaxUploadSizeMiB: "238000"

@@ -61,6 +61,7 @@ ASP.NET Core maps double underscores in environment variables to configuration s
 | `Entra__ClientSecret` | Application secret |
 | `OneDrive__UserId` | Target OneDrive user object ID or UPN |
 | `OneDrive__RootFolder` | Container folder in OneDrive; default `S3` |
+| `S3__URL` | Listener URL including port; default `http://+:9000`. Overrides ASP.NET Core URL/port environment settings. Kubernetes ports are generated from this value. |
 | `S3__AccessKey` | Access key clients use |
 | `S3__SecretKey` | Long random signing secret |
 | `S3__Region` | SigV4 region; default `us-east-1` |
@@ -89,12 +90,13 @@ dotnet test .\OneDriveS3Proxy.sln --configuration Release
 docker build -t onedrive-s3-proxy:local .
 ```
 
-Run the image with the variables above and publish container port 8080. Configure an
-S3 client for path-style addressing:
+Run the image with the variables above and publish the port specified by `S3__URL`.
+For example, use `-e S3__URL=http://+:9000 -p 9000:9000` with `docker run`.
+There is no fixed Docker `EXPOSE` port. Configure an S3 client for path-style addressing:
 
 ```powershell
-aws --endpoint-url http://localhost:8080 s3api list-buckets
-aws --endpoint-url http://localhost:8080 s3 cp .\example.txt s3://example-bucket/example.txt
+aws --endpoint-url http://localhost:9000 s3api list-buckets
+aws --endpoint-url http://localhost:9000 s3 cp .\example.txt s3://example-bucket/example.txt
 ```
 
 Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_DEFAULT_REGION` to the same
@@ -167,11 +169,14 @@ protection to require the `Test` and `Build and publish image` checks before mer
 
 ## Kubernetes
 
-1. Build and push the image, then set the image in `k8s/deployment.yaml` to the version
+1. Build and push the image, then set the image in `k8s/deployment.template.yaml` to the version
    tag CI publishes (for example `ghcr.io/<owner>/onedrive-s3-proxy:0.1.0`). Avoid
    `latest`: with `IfNotPresent` nodes would never pull updates. Change the tag to
    roll out a new version.
-2. Replace the IDs and user in `k8s/configmap.yaml`.
+2. Replace the IDs and user in `k8s/configmap.yaml`. Set `S3__URL` to a single HTTP
+   listener URL with an explicit port, such as `"http://+:9000"`. Keep the value
+   double-quoted. The renderer derives the container port, both probe ports, and
+   Service target port from this URL; the Service's public port remains 80.
 3. Create the secret without checking credentials into source control:
 
    ```powershell
@@ -181,15 +186,17 @@ protection to require the `Test` and `Build and publish image` checks before mer
      --from-literal=S3__SecretKey='<long-random-secret>'
    ```
 
-4. Deploy:
+4. Generate the manifests with PowerShell and deploy:
 
    ```powershell
-   kubectl apply -f .\k8s\configmap.yaml
-   kubectl apply -f .\k8s\deployment.yaml
+   .\k8s\render.ps1 | kubectl apply -f -
    ```
 
 Add an Ingress appropriate for your cluster and terminate TLS there. Do not apply
 `secret.example.yaml`; it is only a key-name reference.
+Do not apply `deployment.template.yaml` directly. Rerun the renderer whenever
+`S3__URL` changes, then restart the pods with
+`kubectl rollout restart deployment/onedrive-s3-proxy` so they reload the ConfigMap.
 
 The liveness endpoint only verifies that the process is running. The readiness endpoint
 validates access to the configured Graph drive and root folder with a five-second
@@ -207,13 +214,13 @@ Before configuring Longhorn, create the bucket because Longhorn does not create 
 can use the AWS CLI or create the bucket folder directly in OneDrive.
 
 ```powershell
-kubectl port-forward service/onedrive-s3-proxy 8080:80
+kubectl port-forward service/onedrive-s3-proxy 9000:80
 ```
 
 In another terminal:
 
 ```powershell
-aws --endpoint-url http://localhost:8080 s3api create-bucket --bucket longhorn
+aws --endpoint-url http://localhost:9000 s3api create-bucket --bucket longhorn
 ```
 
 Create a credential secret in `longhorn-system` using
@@ -278,4 +285,3 @@ Reference: [cloudlena/s3manager](https://github.com/cloudlena/s3manager)
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-

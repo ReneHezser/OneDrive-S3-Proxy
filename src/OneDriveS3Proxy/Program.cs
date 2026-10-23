@@ -4,6 +4,8 @@ using OneDriveS3Proxy.S3;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.WebHost.UseUrls(builder.Configuration["S3:URL"] ?? "http://+:9000");
+
 // Kestrel's 30 MB default would reject uploads far below the configured object limit.
 // The extra MiB leaves room for protocol overhead.
 builder.WebHost.ConfigureKestrel((context, options) =>

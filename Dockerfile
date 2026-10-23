@@ -11,8 +11,8 @@ RUN dotnet publish src/OneDriveS3Proxy/OneDriveS3Proxy.csproj \
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine AS final
 WORKDIR /app
-ENV ASPNETCORE_HTTP_PORTS=8080
-EXPOSE 8080
+ENV ASPNETCORE_HTTP_PORTS="" \
+    S3__URL=http://+:9000
 USER $APP_UID
 COPY --from=build --chown=$APP_UID:$APP_UID /app/publish .
 ENTRYPOINT ["dotnet", "OneDriveS3Proxy.dll"]

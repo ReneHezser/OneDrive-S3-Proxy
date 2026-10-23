@@ -25,7 +25,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: __S3_PORT__
           envFrom:
             - configMapRef:
                 name: onedrive-s3-proxy
@@ -41,14 +41,14 @@ spec:
           readinessProbe:
             httpGet:
               path: /health/ready
-              port: http
+              port: __S3_PORT__
             initialDelaySeconds: 3
             periodSeconds: 10
             timeoutSeconds: 6
           livenessProbe:
             httpGet:
               path: /health/live
-              port: http
+              port: __S3_PORT__
             initialDelaySeconds: 10
             periodSeconds: 20
           securityContext:
@@ -68,4 +68,4 @@ spec:
   ports:
     - name: http
       port: 80
-      targetPort: http
+      targetPort: __S3_PORT__
