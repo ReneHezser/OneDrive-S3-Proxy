@@ -108,16 +108,66 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image and publish for a merged PR or manual main run
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
           push: ${{ steps.publish-policy.outputs.publish == 'true' }}
           tags: |
             ${{ steps.metadata.outputs.image }}:${{ steps.metadata.outputs.version }}
             ${{ steps.metadata.outputs.image }}:latest
             ${{ steps.metadata.outputs.image }}:sha-${{ env.SOURCE_SHA }}
+            ${{ steps.metadata.outputs.image }}:run-${{ github.run_id }}-${{ github.run_attempt }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.metadata.outputs.version }}
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+
+      - name: Tag platform images without creating extra indexes
+        if: ${{ steps.publish-policy.outputs.publish == 'true' }}
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          RUN_TAG: run-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          image = os.environ["IMAGE"]
+          manifest = json.loads(subprocess.check_output(
+              ["docker", "buildx", "imagetools", "inspect", "--raw", f"{image}@{os.environ['IMAGE_DIGEST']}"],
+              text=True))
+          entries = manifest.get("manifests", [])
+          if len(entries) != 2:
+              raise SystemExit("Expected exactly two platform manifests without attestations.")
+
+          digests = {}
+          for architecture in ("amd64", "arm64"):
+              matches = [
+                  entry["digest"] for entry in entries
+                  if entry.get("platform", {}).get("os") == "linux"
+                  and entry.get("platform", {}).get("architecture") == architecture
+              ]
+              if len(matches) != 1 or not isinstance(matches[0], str) or re.fullmatch(r"sha256:[0-9a-f]{64}", matches[0]) is None:
+                  raise SystemExit(f"Expected exactly one valid linux/{architecture} manifest digest.")
+              digests[architecture] = matches[0]
+
+          for architecture, digest in digests.items():
+              tags = [
+                  f"{image}:{os.environ['VERSION']}-{architecture}",
+                  f"{image}:sha-{os.environ['SOURCE_SHA']}-{architecture}",
+                  f"{image}:{os.environ['RUN_TAG']}-{architecture}",
+              ]
+              command = ["docker", "buildx", "imagetools", "create", "--prefer-index=false"]
+              for tag in tags:
+                  command.extend(["--tag", tag])
+              subprocess.run(command + [f"{image}@{digest}"], check=True)
+          PY

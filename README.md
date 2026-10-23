@@ -154,20 +154,33 @@ Publishing uses the workflow's `GITHUB_TOKEN` for GitHub Container Registry (GHC
 no registry password secret is required. The image
 name is `ghcr.io/<owner>/<repository>`, converted to lowercase, with these tags:
 
-- `0.1.0`: the first released version heading in [CHANGELOG.md](CHANGELOG.md).
+- `0.1.3`: the first released version heading in [CHANGELOG.md](CHANGELOG.md).
 - `latest`: the most recent successful merged-PR or manual `main` publish.
 - `sha-<full-commit-sha>`: a commit-specific tag for traceability.
+- `run-<run-id>-<attempt>`: a unique tag that retains the published index when a
+  version or commit is published again.
 
 Merge publishing uses `pull_request_target` only for closed PRs targeting `main`,
 and its jobs require the PR to be merged before checking out the merge commit.
 This permits publishing merged fork PRs without granting open PR builds registry
 write access. Open PR updates continue to use the unprivileged `pull_request` event.
 
-Each tag is a multi-architecture manifest covering `linux/amd64` and `linux/arm64`, so
+These tags reference a multi-architecture manifest covering `linux/amd64` and `linux/arm64`, so
 the same tag works on x64 and ARM64 (for example Raspberry Pi or Graviton/Ampere) nodes.
-Each publish can appear as multiple GHCR versions: the tagged image index, per-platform
-images, and provenance/attestation manifests. These are components of one published
-multi-architecture image, not separate application releases.
+Successful publishes also tag each platform image directly with
+`<version>-amd64` / `<version>-arm64`, `sha-<commit>-amd64` / `sha-<commit>-arm64`,
+and `run-<run-id>-<attempt>-amd64` / `run-<run-id>-<attempt>-arm64`. The run tags
+prevent older platform images from becoming untagged when a version or commit is
+republished. Platform tagging uses the published index's digest rather than moving
+tags, and does not create additional indexes.
+
+Buildx provenance and SBOM attestations are disabled. Each successful publish
+therefore produces three tagged GHCR versions: one multi-architecture index and
+two platform images, not extra untagged attestation manifests. Platform images
+may briefly appear untagged while the final tagging step is running; a failed or
+cancelled publish can leave tagging incomplete. Existing untagged versions from
+older publishes are not removed. Do not delete untagged platform images still
+referenced by an index you intend to keep.
 The .NET build stage in the [Dockerfile](Dockerfile) always runs on the CI runner's
 native platform (`--platform=$BUILDPLATFORM`) and produces architecture-independent
 output, so no QEMU emulation is needed. Keep it that way: a `RUN` instruction in the
