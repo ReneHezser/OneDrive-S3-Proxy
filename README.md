@@ -111,11 +111,12 @@ S3 values configured on the proxy. Use TLS at the ingress or load balancer in pr
 ## CI, dependency updates, and container images
 
 [GitHub Actions](.github/workflows/ci.yml) restores dependencies and runs the Release
-test suite on pushes to `main` and on pull requests. Changes that only touch files under
+test suite on pushes to `main` and on pull requests, including when a PR is merged.
+Closing a PR without merging skips the jobs. Changes that only touch files under
 `.github/` (workflows, Dependabot configuration) do not trigger it; a change that also
 touches any other file does. The Docker image is built only after tests pass. Pull
-requests (including Dependabot and fork PRs) and manual runs on other branches build
-without logging in or publishing. If you require the `Test` and `Build and publish
+request updates (including Dependabot and fork PRs), direct pushes, and all manual
+runs build without logging in or publishing. If you require the `Test` and `Build and publish
 image` checks in branch protection, a PR that only changes `.github/` files will wait
 on checks that never run, so temporarily adjust the rule or merge it as an admin.
 
@@ -129,21 +130,30 @@ the workflow with `workflow_dispatch` enabled. Alternatively, use the GitHub CLI
 gh workflow run ci.yml --ref <branch-name>
 ```
 
-Manual runs on any branch other than `main` run the tests and Docker build without
-publishing an image.
+Manual runs on every branch, including `main`, run the tests and Docker build
+without publishing an image.
 
-Images are published only from the `main` branch: pushes to `main` and manual runs
-started on `main` push to GitHub Container Registry (GHCR) using the workflow's
-`GITHUB_TOKEN`; no registry password secret is required. Pull requests and every other
-branch never log in to or push to the registry. The image
+Images are published only when a pull request is **merged into `main`**, using
+the PR's merge commit for checkout, image revision, and SHA tag. Direct pushes to
+`main`, open PR updates, unmerged PR closures, and manual CI runs never publish.
+Publishing uses the workflow's `GITHUB_TOKEN` for GitHub Container Registry (GHCR);
+no registry password secret is required. The image
 name is `ghcr.io/<owner>/<repository>`, converted to lowercase, with these tags:
 
 - `0.1.0`: the first released version heading in [CHANGELOG.md](CHANGELOG.md).
-- `latest`: the most recent successful `main` build.
+- `latest`: the most recent successful merged-PR publish.
 - `sha-<full-commit-sha>`: a commit-specific tag for traceability.
+
+Merge publishing uses `pull_request_target` only for closed PRs targeting `main`,
+and its jobs require the PR to be merged before checking out the merge commit.
+This permits publishing merged fork PRs without granting open PR builds registry
+write access. Open PR updates continue to use the unprivileged `pull_request` event.
 
 Each tag is a multi-architecture manifest covering `linux/amd64` and `linux/arm64`, so
 the same tag works on x64 and ARM64 (for example Raspberry Pi or Graviton/Ampere) nodes.
+Each publish can appear as multiple GHCR versions: the tagged image index, per-platform
+images, and provenance/attestation manifests. These are components of one published
+multi-architecture image, not separate application releases.
 The .NET build stage in the [Dockerfile](Dockerfile) always runs on the CI runner's
 native platform (`--platform=$BUILDPLATFORM`) and produces architecture-independent
 output, so no QEMU emulation is needed. Keep it that way: a `RUN` instruction in the
@@ -156,7 +166,7 @@ To change the version tag, add a new release heading and its release notes befor
 merging to `main`. For example, `## [0.2.0] - 2026-11-01` produces
 `ghcr.io/<owner>/<repository>:0.2.0`.
 
-Version and `latest` tags move on each `main` publish, even if the changelog
+Version and `latest` tags move on each merged-PR publish, even if the changelog
 version has not changed. Use an image digest for immutable deployments; the SHA tag
 identifies the source commit but can also be overwritten by a workflow rerun.
 This workflow does not create Git tags or GitHub Releases. If release-only images
@@ -168,20 +178,8 @@ workflow to write packages. GHCR packages may initially be private; adjust the
 package visibility for public pulls, or configure a Kubernetes image-pull secret
 for private images.
 
-[Cleanup SHA-only packages](.github/workflows/cleanup-packages.yml) runs after a
-successful publishing CI run on `main`, or manually from `main` using
-`gh workflow run cleanup-packages.yml --ref main`. It deletes image versions whose
-only tag is `sha-<full-commit-sha>`, without an age or retention limit. Versions with
-`latest`, release tags, other tags, or no tags are preserved; untagged
-multi-architecture components are not deleted. Old SHA-only image references will
-no longer be available to pull after cleanup. The workflow lists all version pages
-and rechecks each candidate's tags immediately before deleting it.
-
-Cleanup uses `GITHUB_TOKEN` with `packages: write`. The repository must have
-**Admin** access to the GHCR package to delete versions; check the package's
-**Manage Actions access** settings if cleanup fails with a permissions error.
-Packages published by this repository's workflow normally grant it admin access.
-Cleanup failures are reported separately and do not change the publishing CI result.
+Package versions are not deleted automatically. Older merged-PR builds and
+multi-architecture components remain in GHCR unless removed manually.
 
 [Dependabot](.github/dependabot.yml) checks NuGet packages in the solution, Docker
 base images, and GitHub Actions weekly. NuGet, Docker, and action updates are grouped by
