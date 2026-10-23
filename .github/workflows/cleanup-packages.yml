@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
 
       - name: Delete versions with only a commit SHA tag
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const cleanup = require('./.github/scripts/cleanup-packages.cjs');
