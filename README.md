@@ -4,8 +4,8 @@ An ASP.NET Core proxy that exposes a focused S3-compatible API and stores object
 OneDrive for Business through Microsoft Graph.
 
 Each S3 bucket is a folder below the configured OneDrive root folder. Object payloads
-use hash-addressed internal paths so S3 keys that differ only by case, repeated slashes,
-or OneDrive-reserved characters remain distinct. The service uses an Entra application
+use their original S3 key paths directly under the bucket, subject to OneDrive's
+file-name, path-length, and case-insensitive naming restrictions. The service uses an Entra application
 and the OAuth 2.0 client-credentials flow. `Azure.Identity` caches and refreshes the
 Graph access token for the process lifetime.
 
@@ -71,19 +71,30 @@ ASP.NET Core maps double underscores in environment variables to configuration s
 
 ## OneDrive storage layout
 
-Bucket folders remain visible below `OneDrive__RootFolder`, but objects written by the
-proxy are implementation data rather than directly editable OneDrive documents:
+Object payloads are stored directly under their bucket using the original S3 key.
+For example, `backupstore/volumes/backup.blk` in bucket `longhorn` is stored at
+`S3/longhorn/backupstore/volumes/backup.blk` when `OneDrive__RootFolder` is `S3`.
+The proxy creates subfolders as needed; new objects do not use a DataFolder.
 
-- Payloads are stored below each bucket's `.onedrive-s3-proxy-objects` folder using a
-  SHA-256 hash of the complete, case-sensitive S3 key.
-- Original keys, content headers, user metadata, and tags are stored below the root
-  `.onedrive-s3-proxy-state` folder.
-- Multipart bodies use immutable names below the state folder until completion.
+OneDrive file names and paths constrain the accepted S3 keys. New writes reject
+empty path segments, leading/trailing slashes, leading/trailing spaces, trailing
+dots, reserved names, unsupported characters, and paths exceeding 400 characters
+(including the configured root and bucket). Keys that differ only in case, and
+file/folder conflicts such as `a` and `a/b`, cannot coexist and are rejected rather
+than overwriting another object.
 
-Do not rename, edit, or delete these internal folders directly. Objects created by older
-versions with key-shaped OneDrive paths remain readable and listable when every path
-segment is an exact, valid OneDrive name. Re-uploading or overwriting such an object
-moves its payload to the hash-addressed layout.
+Content headers, user metadata, and tags remain in the root's
+`.onedrive-s3-proxy-state` folder. Unfinished multipart bodies use immutable names
+there; multipart completion writes the object at its original key path.
+Do not edit or delete the internal state folder. Editing payloads directly in
+OneDrive does not update the associated S3 metadata.
+
+Starting with version 0.1.3, the old hashed payload layout is not supported.
+Existing files below `.onedrive-s3-proxy-objects` are treated as ordinary files at
+their literal paths, not resolved to their original S3 keys. Migrate or recreate
+old objects at their original key paths before upgrading. The proxy does not
+automatically migrate, hide, or delete old payloads. Metadata identifiers in the
+separate state folder remain hashed; object payloads do not.
 
 ## Build and run
 

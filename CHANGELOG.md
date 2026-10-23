@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-10-23
+
+### Changed
+
+- Store object payloads directly under each bucket using their original S3 key paths,
+  including copies and completed multipart uploads, instead of an internal DataFolder.
+- Reject keys that OneDrive cannot represent safely, including unsupported names,
+  case-only collisions, file/folder conflicts, and paths exceeding OneDrive's limits.
+- Keep content headers, user metadata, tags, and unfinished multipart uploads in the
+  separate internal state folder.
+
 ## [0.1.2] - 2026-10-23
 
 ### Added

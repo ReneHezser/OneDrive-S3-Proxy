@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -19,15 +18,11 @@ public sealed class OneDriveStore(
     private const int UploadChunkSize = 10 * 1024 * 1024;
     private const long MinimumMultipartPartSize = 5 * 1024 * 1024;
     private const int StateWriteAttempts = 3;
-    private const int ListConcurrency = 4;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly ProxyOptions _options = options.Value;
     private readonly HttpClient _monitorClient = httpClientFactory.CreateClient("GraphMonitor");
     private readonly SemaphoreSlim _rootLock = new(1, 1);
     private readonly SemaphoreSlim _readinessLock = new(1, 1);
-    // A data file name is the SHA-256 of its key, so a hash-to-key mapping never goes stale.
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> _keysByHash =
-        new(StringComparer.Ordinal);
     private volatile bool _rootReady;
     private DateTimeOffset _readyUntil;
 
@@ -66,7 +61,6 @@ public sealed class OneDriveStore(
         await DeletePathAsync(BucketPath(bucket), ignoreMissing: false, cancellationToken);
         await DeletePathAsync(StatePath("objects", bucket), ignoreMissing: true, cancellationToken);
         await DeletePathAsync(MultipartBucketPath(bucket), ignoreMissing: true, cancellationToken);
-        _keysByHash.TryRemove(bucket, out _);
     }
 
     public async Task<IReadOnlyList<ObjectInfo>> ListObjectsAsync(string bucket, CancellationToken cancellationToken)
@@ -77,23 +71,16 @@ public sealed class OneDriveStore(
         }
 
         var results = new Dictionary<string, ObjectInfo>(StringComparer.Ordinal);
-        var legacyFolders = new Queue<(string Path, string Prefix)>();
-        legacyFolders.Enqueue((BucketPath(bucket), string.Empty));
-        while (legacyFolders.TryDequeue(out var folder))
+        var folders = new Queue<(string Path, string Prefix)>();
+        folders.Enqueue((BucketPath(bucket), string.Empty));
+        while (folders.TryDequeue(out var folder))
         {
             foreach (var item in await GetChildrenAsync(folder.Path, cancellationToken))
             {
-                if (folder.Prefix.Length == 0 &&
-                    item.Folder is not null &&
-                    item.Name == OneDrivePathMapper.DataFolder)
-                {
-                    continue;
-                }
-
                 var key = string.IsNullOrEmpty(folder.Prefix) ? item.Name : $"{folder.Prefix}/{item.Name}";
                 if (item.Folder is not null)
                 {
-                    legacyFolders.Enqueue(($"{folder.Path}/{item.Name}", key));
+                    folders.Enqueue(($"{folder.Path}/{item.Name}", key));
                 }
                 else
                 {
@@ -102,66 +89,7 @@ public sealed class OneDriveStore(
             }
         }
 
-        await ListDataObjectsAsync(bucket, results, cancellationToken);
         return results.Values.OrderBy(item => item.Key, StringComparer.Ordinal).ToList();
-    }
-
-    private async Task ListDataObjectsAsync(
-        string bucket,
-        Dictionary<string, ObjectInfo> results,
-        CancellationToken cancellationToken)
-    {
-        var dataRoot = $"{BucketPath(bucket)}/{OneDrivePathMapper.DataFolder}";
-        var shards = await TryGetChildrenAsync(dataRoot, cancellationToken);
-        var dataItems = new ConcurrentDictionary<string, DriveItem>(StringComparer.Ordinal);
-        await Parallel.ForEachAsync(
-            shards.Where(shard => shard.Folder is not null),
-            new ParallelOptions { MaxDegreeOfParallelism = ListConcurrency, CancellationToken = cancellationToken },
-            async (shard, token) =>
-            {
-                foreach (var item in await GetChildrenAsync($"{dataRoot}/{shard.Name}", token))
-                {
-                    if (item.Folder is null && item.Name.EndsWith(".data", StringComparison.Ordinal))
-                    {
-                        dataItems[item.Name[..^".data".Length]] = item;
-                    }
-                }
-            });
-
-        var knownKeys = _keysByHash.GetOrAdd(bucket, _ => new ConcurrentDictionary<string, string>(StringComparer.Ordinal));
-        var currentKeys = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
-        await Parallel.ForEachAsync(
-            dataItems.Keys,
-            new ParallelOptions { MaxDegreeOfParallelism = ListConcurrency, CancellationToken = cancellationToken },
-            async (hash, token) =>
-            {
-                if (!knownKeys.TryGetValue(hash, out var key))
-                {
-                    try
-                    {
-                        var state = await GetJsonAsync<ObjectState>(
-                            StatePath("objects", bucket, hash[..2], $"{hash}.json"),
-                            token);
-                        key = state.Key;
-                    }
-                    catch (GraphStoreException exception) when (exception.StatusCode == 404)
-                    {
-                        return;
-                    }
-                }
-
-                if (key is not null && OneDrivePathMapper.Hash(key) == hash)
-                {
-                    currentKeys[hash] = key;
-                }
-            });
-
-        // Dropping hashes that no longer have data keeps the cache sized to the live objects.
-        _keysByHash[bucket] = currentKeys;
-        foreach (var (hash, key) in currentKeys)
-        {
-            results[key] = ToObjectInfo(key, dataItems[hash]);
-        }
     }
 
     public async Task<ObjectInfo> PutObjectAsync(
@@ -172,17 +100,7 @@ public sealed class OneDriveStore(
         CancellationToken cancellationToken)
     {
         await EnsureBucketAndLengthAsync(bucket, length, cancellationToken);
-        var item = await UploadFileAsync(
-            ObjectDataPath(bucket, key),
-            content,
-            length!.Value,
-            requireExistingBucket: true,
-            cancellationToken);
-        if (await TryResolveLegacyObjectAsync(bucket, key, cancellationToken) is { } legacy)
-        {
-            await DeletePathAsync(legacy.Path, ignoreMissing: true, cancellationToken);
-        }
-
+        var item = await UploadObjectAsync(bucket, key, content, length!.Value, cancellationToken);
         return ToObjectInfo(key, item);
     }
 
@@ -192,11 +110,11 @@ public sealed class OneDriveStore(
         string? range,
         CancellationToken cancellationToken)
     {
-        var (path, item) = await ResolveObjectAsync(bucket, key, cancellationToken);
+        var (_, item) = await ResolveObjectAsync(bucket, key, cancellationToken);
         var info = ToObjectInfo(key, item);
         var request = await CreateRequestAsync(
             HttpMethod.Get,
-            $"{ItemPath(path)}:/content",
+            $"{ItemIdPath(item.Id)}/content",
             null,
             cancellationToken);
         if (range is not null)
@@ -221,10 +139,9 @@ public sealed class OneDriveStore(
 
     public async Task DeleteObjectAsync(string bucket, string key, CancellationToken cancellationToken)
     {
-        await DeletePathAsync(ObjectDataPath(bucket, key), ignoreMissing: true, cancellationToken);
-        if (await TryResolveLegacyObjectAsync(bucket, key, cancellationToken) is { } legacy)
+        if (await TryResolveDirectObjectAsync(bucket, key, cancellationToken) is { } direct)
         {
-            await DeletePathAsync(legacy.Path, ignoreMissing: true, cancellationToken);
+            await DeletePathAsync(direct.Path, ignoreMissing: true, cancellationToken, ItemIdPath(direct.Item.Id));
         }
 
         await DeleteObjectStateAsync(bucket, key, cancellationToken);
@@ -237,29 +154,22 @@ public sealed class OneDriveStore(
         string destinationKey,
         CancellationToken cancellationToken)
     {
-        var (sourcePath, _) = await ResolveObjectAsync(sourceBucket, sourceKey, cancellationToken);
+        var (_, sourceItem) = await ResolveObjectAsync(sourceBucket, sourceKey, cancellationToken);
         if (!await BucketExistsAsync(destinationBucket, cancellationToken))
         {
             throw new GraphStoreException(404, "The destination bucket does not exist.", "NoSuchBucket");
         }
 
-        var destinationPath = ObjectDataPath(destinationBucket, destinationKey);
-        await EnsureParentFoldersForPathAsync(
-            destinationPath,
-            requireExistingBucket: true,
-            cancellationToken);
-
-        var parentPath = destinationPath[..destinationPath.LastIndexOf('/')];
-        var parent = await GetItemAsync(parentPath, cancellationToken);
-        var name = destinationPath.Split('/').Last();
+        var destination = await PrepareObjectDestinationAsync(destinationBucket, destinationKey, cancellationToken);
+        var name = destination.Path.Split('/').Last();
         using var body = JsonContent.Create(new
         {
-            parentReference = new { id = parent.Id },
+            parentReference = new { id = destination.Parent.Id },
             name
         });
         using var response = await SendAsync(
             HttpMethod.Post,
-            $"{ItemPath(sourcePath)}:/copy?@microsoft.graph.conflictBehavior=replace",
+            $"{ItemIdPath(sourceItem.Id)}/copy?@microsoft.graph.conflictBehavior={(destination.Existing is null ? "fail" : "replace")}",
             body,
             cancellationToken);
         await EnsureSuccessAsync(response, cancellationToken);
@@ -268,12 +178,13 @@ public sealed class OneDriveStore(
             ?? throw new GraphStoreException(502, "Microsoft Graph did not return a copy monitor URL.");
         await MonitorCopyAsync(monitorUrl, cancellationToken);
 
-        var copied = await TryGetItemAsync(destinationPath, cancellationToken)
+        var copied = await TryGetItemAsync(destination.Path, cancellationToken)
             ?? throw new GraphStoreException(502, "Microsoft Graph completed the copy without creating the destination item.");
-        if (await TryResolveLegacyObjectAsync(destinationBucket, destinationKey, cancellationToken) is { } legacy)
+        if (copied.Folder is not null || !copied.Name.Equals(name, StringComparison.Ordinal))
         {
-            await DeletePathAsync(legacy.Path, ignoreMissing: true, cancellationToken);
+            throw new GraphStoreException(502, "Microsoft Graph returned a copy destination with an unexpected name or type.");
         }
+
 
         return ToObjectInfo(destinationKey, copied);
     }
@@ -371,6 +282,7 @@ public sealed class OneDriveStore(
         ObjectState state,
         CancellationToken cancellationToken)
     {
+        OneDrivePathMapper.ObjectPath(_options.OneDrive.RootFolder, bucket, key);
         if (!await BucketExistsAsync(bucket, cancellationToken))
         {
             throw new GraphStoreException(404, "The specified bucket does not exist.", "NoSuchBucket");
@@ -508,17 +420,8 @@ public sealed class OneDriveStore(
                     500,
                     $"Stored state for part {part.PartNumber} has no data reference."))).ToList(),
             OpenPathDownloadAsync);
-        var item = await UploadFileAsync(
-            ObjectDataPath(bucket, key),
-            combined,
-            totalLength,
-            requireExistingBucket: true,
-            cancellationToken);
+        var item = await UploadObjectAsync(bucket, key, combined, totalLength, cancellationToken);
         await PutObjectStateAsync(bucket, key, upload.State, cancellationToken);
-        if (await TryResolveLegacyObjectAsync(bucket, key, cancellationToken) is { } legacy)
-        {
-            await DeletePathAsync(legacy.Path, ignoreMissing: true, cancellationToken);
-        }
 
         await DeletePathAsync(MultipartUploadPath(bucket, uploadId), ignoreMissing: true, cancellationToken);
         return ToObjectInfo(key, item);
@@ -599,19 +502,111 @@ public sealed class OneDriveStore(
         }
     }
 
+    private async Task<DriveItem> UploadObjectAsync(
+        string bucket,
+        string key,
+        Stream content,
+        long length,
+        CancellationToken cancellationToken)
+    {
+        var destination = await PrepareObjectDestinationAsync(bucket, key, cancellationToken);
+        var resourcePath = destination.Existing is { } existing
+            ? ItemIdPath(existing.Id)
+            : $"{ItemIdPath(destination.Parent.Id)}:/{Escape(key.Split('/').Last())}:";
+        try
+        {
+            var item = await UploadFileAsync(
+                destination.Path, content, length, requireExistingBucket: true, cancellationToken,
+                resourcePath, createOnly: destination.Existing is null);
+            if (item.Folder is not null || !item.Name.Equals(key.Split('/').Last(), StringComparison.Ordinal))
+            {
+                throw new GraphStoreException(502, "Microsoft Graph returned an uploaded item with an unexpected name or type.");
+            }
+
+            return item;
+        }
+        catch (GraphStoreException exception) when (exception.StatusCode == 409)
+        {
+            throw new GraphStoreException(409, exception.Message, "OperationAborted");
+        }
+    }
+
+    private async Task<(string Path, DriveItem Parent, DriveItem? Existing)> PrepareObjectDestinationAsync(
+        string bucket,
+        string key,
+        CancellationToken cancellationToken)
+    {
+        var path = OneDrivePathMapper.ObjectPath(_options.OneDrive.RootFolder, bucket, key);
+        var parentPath = BucketPath(bucket);
+        var parent = await TryGetItemAsync(parentPath, cancellationToken);
+        if (parent?.Folder is null)
+        {
+            throw new GraphStoreException(404, "The specified bucket does not exist.", "NoSuchBucket");
+        }
+
+        if (!parent.Name.Equals(bucket, StringComparison.Ordinal))
+        {
+            throw ObjectPathConflict();
+        }
+
+        var segments = key.Split('/');
+        for (var index = 0; index < segments.Length; index++)
+        {
+            var segment = segments[index];
+            var candidate = $"{parentPath}/{segment}";
+            var item = await TryGetItemAsync(candidate, cancellationToken);
+            if (index == segments.Length - 1)
+            {
+                if (item is not null &&
+                    (item.Folder is not null || !item.Name.Equals(segment, StringComparison.Ordinal)))
+                {
+                    throw ObjectPathConflict();
+                }
+
+                return (path, parent, item);
+            }
+
+            if (item is null)
+            {
+                await CreateFolderAsync(parentPath, segment, allowExisting: true, cancellationToken);
+                item = await GetItemAsync(candidate, cancellationToken);
+            }
+
+            if (item.Folder is null || !item.Name.Equals(segment, StringComparison.Ordinal))
+            {
+                throw ObjectPathConflict();
+            }
+
+            parentPath = candidate;
+            parent = item;
+        }
+
+        throw new GraphStoreException(400, "An object key is required.", "InvalidArgument");
+    }
+
+    private static GraphStoreException ObjectPathConflict() =>
+        new(400, "The object key conflicts with an existing OneDrive file, folder, or differently cased path.", "InvalidArgument");
+
     private async Task<DriveItem> UploadFileAsync(
         string path,
         Stream content,
         long length,
         bool requireExistingBucket,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? resourcePath = null,
+        bool createOnly = false)
     {
         if (length > MaximumObjectSize)
         {
             throw new GraphStoreException(413, $"The object exceeds {_options.S3.MaxUploadSizeMiB} MiB.");
         }
 
-        await EnsureParentFoldersForPathAsync(path, requireExistingBucket, cancellationToken);
+        if (resourcePath is null)
+        {
+            await EnsureParentFoldersForPathAsync(path, requireExistingBucket, cancellationToken);
+        }
+
+        resourcePath ??= $"{ItemPath(path)}:";
         if (length <= SimpleUploadLimit)
         {
             using var body = new StreamContent(content);
@@ -619,7 +614,7 @@ public sealed class OneDriveStore(
             body.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
             using var response = await SendAsync(
                 HttpMethod.Put,
-                $"{ItemPath(path)}:/content",
+                $"{resourcePath}/content{(createOnly ? "?@microsoft.graph.conflictBehavior=fail" : string.Empty)}",
                 body,
                 cancellationToken);
             await EnsureSuccessAsync(response, cancellationToken);
@@ -633,12 +628,12 @@ public sealed class OneDriveStore(
             ["item"] = new Dictionary<string, object>
             {
                 ["name"] = fileName,
-                ["@microsoft.graph.conflictBehavior"] = "replace"
+                ["@microsoft.graph.conflictBehavior"] = createOnly ? "fail" : "replace"
             }
         });
         using var sessionResponse = await SendAsync(
             HttpMethod.Post,
-            $"{ItemPath(path)}:/createUploadSession",
+            $"{resourcePath}/createUploadSession",
             sessionBody,
             cancellationToken);
         await EnsureSuccessAsync(sessionResponse, cancellationToken);
@@ -807,27 +802,20 @@ public sealed class OneDriveStore(
         string key,
         CancellationToken cancellationToken)
     {
-        var dataPath = ObjectDataPath(bucket, key);
-        var item = await TryGetItemAsync(dataPath, cancellationToken);
-        if (item is not null && item.Folder is null)
+        if (await TryResolveDirectObjectAsync(bucket, key, cancellationToken) is { } direct)
         {
-            return (dataPath, item);
-        }
-
-        if (await TryResolveLegacyObjectAsync(bucket, key, cancellationToken) is { } legacy)
-        {
-            return legacy;
+            return direct;
         }
 
         throw new GraphStoreException(404, "The specified object does not exist.", "NoSuchKey");
     }
 
-    private async Task<(string Path, DriveItem Item)?> TryResolveLegacyObjectAsync(
+    private async Task<(string Path, DriveItem Item)?> TryResolveDirectObjectAsync(
         string bucket,
         string key,
         CancellationToken cancellationToken)
     {
-        if (!IsLegacyPathCompatible(key))
+        if (!OneDrivePathMapper.IsDirectKeyCompatible(key))
         {
             return null;
         }
@@ -849,31 +837,6 @@ public sealed class OneDriveStore(
         }
 
         return item is not null && item.Folder is null ? (path, item) : null;
-    }
-
-    private static bool IsLegacyPathCompatible(string key)
-    {
-        var segments = key.Split('/');
-        return segments.All(segment =>
-            segment.Length > 0 &&
-            segment.Length <= 255 &&
-            segment is not "." and not ".." &&
-            !segment.EndsWith(' ') &&
-            !segment.EndsWith('.') &&
-            segment.IndexOfAny(['"', '*', ':', '<', '>', '?', '\\', '|']) < 0 &&
-            segment.All(character => !char.IsControl(character)));
-    }
-
-    private async Task<List<DriveItem>> TryGetChildrenAsync(string path, CancellationToken cancellationToken)
-    {
-        try
-        {
-            return await GetChildrenAsync(path, cancellationToken);
-        }
-        catch (GraphStoreException exception) when (exception.StatusCode == 404)
-        {
-            return [];
-        }
     }
 
     private async Task<DriveItem?> TryGetItemAsync(string path, CancellationToken cancellationToken)
@@ -909,9 +872,10 @@ public sealed class OneDriveStore(
     private async Task DeletePathAsync(
         string path,
         bool ignoreMissing,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? resourcePath = null)
     {
-        using var response = await SendAsync(HttpMethod.Delete, ItemPath(path), null, cancellationToken);
+        using var response = await SendAsync(HttpMethod.Delete, resourcePath ?? ItemPath(path), null, cancellationToken);
         if (ignoreMissing && response.StatusCode == HttpStatusCode.NotFound)
         {
             return;
@@ -1016,9 +980,6 @@ public sealed class OneDriveStore(
     private string BucketPath(string bucket) =>
         OneDrivePathMapper.BucketPath(_options.OneDrive.RootFolder, bucket);
 
-    private string ObjectDataPath(string bucket, string key) =>
-        OneDrivePathMapper.ObjectDataPath(_options.OneDrive.RootFolder, bucket, key);
-
     private string StatePath(params string[] segments) =>
         $"{_options.OneDrive.RootFolder}/{StateFolder}/{string.Join('/', segments)}";
 
@@ -1048,6 +1009,9 @@ public sealed class OneDriveStore(
 
     private string ItemPath(string path) =>
         $"users/{Escape(_options.OneDrive.UserId)}/drive/root:/{EncodePath(path)}";
+
+    private string ItemIdPath(string id) =>
+        $"users/{Escape(_options.OneDrive.UserId)}/drive/items/{Escape(id)}";
 
     private static string EncodePath(string path) =>
         string.Join('/', path.Split('/', StringSplitOptions.RemoveEmptyEntries).Select(Escape));
