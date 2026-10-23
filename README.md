@@ -61,6 +61,8 @@ ASP.NET Core maps double underscores in environment variables to configuration s
 | `Entra__ClientSecret` | Application secret |
 | `OneDrive__UserId` | Target OneDrive user object ID or UPN |
 | `OneDrive__RootFolder` | Container folder in OneDrive; default `S3` |
+| `OneDrive__MaxConcurrency` | Concurrent outbound Graph/upload/monitor requests per proxy instance (through response headers), from 1 through 32; default `4` |
+| `OneDrive__MaxRetries` | Retries per Graph request after HTTP 429, from 0 through 10; default `5` |
 | `S3__URL` | Listener URL including port; default `http://+:9000`. Overrides ASP.NET Core URL/port environment settings. Kubernetes ports are generated from this value. |
 | `S3__AccessKey` | Access key clients use |
 | `S3__SecretKey` | Long random signing secret |
@@ -222,6 +224,27 @@ validates access to the configured Graph drive and root folder with a five-secon
 deadline, then caches success for 30 seconds to limit probe traffic.
 
 ## Longhorn backup target
+
+### Microsoft Graph throttling
+
+Longhorn block uploads can exceed OneDrive's request limits. The proxy retries
+HTTP 429 responses, honoring the `Retry-After` header (seconds or HTTP date), then
+`error.retryAfterSeconds` in the JSON response, or exponential backoff with jitter
+when neither is available. A shared cooldown pauses new outbound requests across
+uploads, metadata operations, and copy monitoring within each proxy instance.
+Upload request bodies are buffered up to 10 MiB for replay; complete large objects
+are not buffered in memory. Each throttled retry and exhausted retry budget is logged.
+
+The default concurrency limit is four requests per instance, with up to five retries
+per request. Set `OneDrive__MaxConcurrency` to `1` or `2` and reduce Longhorn backup
+concurrency if throttling persists. Multiple proxy replicas each have their own
+limit and cooldown; these controls do not coordinate across pods or remove
+Microsoft's service limits. Waiting respects request cancellation and HTTP client
+timeouts. After retries are exhausted, the proxy still returns S3 `503 SlowDown`,
+so a sustained service limit can still fail a backup. Apply configuration changes
+and restart the pods before retrying the backup.
+
+### Backup configuration
 
 The proxy is compatible with the S3 operations used by Longhorn volume backups:
 `ListObjectsV2`, `HeadObject`, single-part `PutObject`, `GetObject`, and

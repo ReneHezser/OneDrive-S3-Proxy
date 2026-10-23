@@ -360,7 +360,7 @@ public sealed class OneDriveStore(
     }
 
     private static bool IsTransient(GraphStoreException exception) =>
-        exception.StatusCode is 429 or >= 500;
+        exception.StatusCode >= 500;
 
     public Task DeleteObjectStateAsync(string bucket, string key, CancellationToken cancellationToken) =>
         DeletePathAsync(ObjectStatePath(bucket, key), ignoreMissing: true, cancellationToken);

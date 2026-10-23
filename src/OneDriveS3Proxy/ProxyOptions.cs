@@ -37,6 +37,12 @@ public sealed class OneDriveOptions
 
     [Required]
     public string RootFolder { get; init; } = "S3";
+
+    [Range(1, 32)]
+    public int MaxConcurrency { get; init; } = 4;
+
+    [Range(0, 10)]
+    public int MaxRetries { get; init; } = 5;
 }
 
 public sealed class S3Options

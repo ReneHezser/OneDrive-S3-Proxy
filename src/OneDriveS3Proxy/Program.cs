@@ -19,18 +19,22 @@ builder.Services
     .Bind(builder.Configuration)
     .ValidateDataAnnotations()
     .ValidateOnStart();
+builder.Services.AddSingleton<GraphRequestCoordinator>();
+builder.Services.AddTransient<GraphThrottlingHandler>();
 builder.Services
     .AddHttpClient("MicrosoftGraph", client =>
     {
         client.BaseAddress = new Uri("https://graph.microsoft.com/v1.0/");
         client.Timeout = TimeSpan.FromMinutes(10);
     })
+    .AddHttpMessageHandler<GraphThrottlingHandler>()
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
     {
         PooledConnectionLifetime = TimeSpan.FromMinutes(10)
     });
 builder.Services
     .AddHttpClient("GraphMonitor")
+    .AddHttpMessageHandler<GraphThrottlingHandler>()
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
     {
         AllowAutoRedirect = false,

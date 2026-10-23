@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-10-23
+
+### Added
+
+- Configurable outbound Graph concurrency through `OneDrive__MaxConcurrency`
+  (1 through 32; default `4`) and HTTP 429 retry limits through
+  `OneDrive__MaxRetries` (0 through 10; default `5`).
+- Shared throttling cooldown across uploads, metadata operations, and copy monitoring
+  within each proxy instance.
+
+### Fixed
+
+- Retry Microsoft Graph throttling responses using `Retry-After` or
+  `error.retryAfterSeconds`, with exponential backoff and jitter when neither is
+  available, instead of immediately failing Longhorn backup block uploads.
+- Safely replay upload request bodies with buffering limited to 10 MiB, while
+  honoring cancellation and preserving `SlowDown` errors when retries are exhausted.
+
 ## [0.1.1] - 2026-10-23
 
 ### Added
