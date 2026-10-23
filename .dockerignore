@@ -1,0 +1,7 @@
+**/bin
+**/obj
+.git
+.github
+tests
+README.md
+k8s

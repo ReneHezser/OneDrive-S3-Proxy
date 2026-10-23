@@ -1,0 +1,56 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+publish/
+artifacts/
+
+# Test results and coverage
+TestResults/
+coverage/
+*.trx
+*.coverage
+*.coveragexml
+coverage.*.xml
+coverage.json
+coverage.cobertura.xml
+
+# Visual Studio / VS Code / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local configuration and secrets
+appsettings.Local.json
+appsettings.*.Local.json
+.env
+.env.*
+!.env.example
+*.pfx
+*.key
+secrets.yaml
+secrets.yml
+k8s/*secret*.yaml
+k8s/*secret*.yml
+!k8s/*secret*.example.yaml
+!k8s/*secret*.example.yml

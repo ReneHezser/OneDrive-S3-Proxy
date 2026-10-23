@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3manager
+  labels:
+    app.kubernetes.io/name: s3manager
+    app.kubernetes.io/part-of: onedrive-s3-proxy-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3manager
+        app.kubernetes.io/part-of: onedrive-s3-proxy-test
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: s3manager
+          image: docker.io/cloudlena/s3manager:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ENDPOINT
+              value: onedrive-s3-proxy:80
+            - name: REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: onedrive-s3-proxy
+                  key: S3__Region
+            - name: ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: onedrive-s3-proxy
+                  key: S3__AccessKey
+            - name: SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: onedrive-s3-proxy
+                  key: S3__SecretKey
+            - name: USE_SSL
+              value: "false"
+            - name: SIGNATURE_TYPE
+              value: V4
+            - name: BUCKET_LOOKUP
+              value: Path
+            - name: SHOW_VERSIONS
+              value: "false"
+            - name: SHOW_METADATA
+              value: "true"
+            - name: LIST_RECURSIVE
+              value: "false"
+            - name: ALLOW_DELETE
+              value: "true"
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3manager
+  labels:
+    app.kubernetes.io/name: s3manager
+spec:
+  selector:
+    app.kubernetes.io/name: s3manager
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

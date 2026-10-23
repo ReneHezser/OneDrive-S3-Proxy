@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: onedrive-s3-proxy
+data:
+  Entra__TenantId: "00000000-0000-0000-0000-000000000000"
+  Entra__ClientId: "00000000-0000-0000-0000-000000000000"
+  OneDrive__UserId: "user@contoso.com"
+  OneDrive__RootFolder: "S3"
+  S3__Region: "us-east-1"
+  S3__MaxUploadSizeMiB: "238000"
