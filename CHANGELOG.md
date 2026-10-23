@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Publish multi-architecture (`linux/amd64` and `linux/arm64`) container images; the
+  build stage runs natively, so no emulation is required.
 - Store object payloads at hash-addressed paths so case-sensitive S3 keys and keys with
   repeated slashes or OneDrive-reserved characters remain distinct.
 - Raise the configurable object-size limit to 238,000 MiB, below OneDrive's 250 GB
@@ -60,7 +62,7 @@ Initial release.
 - Microsoft Entra client-credentials authentication with cached Graph access tokens.
 - Environment-based configuration, a Dockerfile, and Kubernetes deployment manifests.
 - Longhorn backup target and s3manager configuration examples and compatibility tests.
-- GitHub Actions CI for PR testing, Docker builds, and default-branch GHCR publishing
+- GitHub Actions CI for PR testing, Docker builds, and `main`-branch GHCR publishing
   with changelog-derived version tags, plus weekly Dependabot updates.
 
 ### Known limitations

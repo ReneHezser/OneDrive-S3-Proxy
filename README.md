@@ -103,9 +103,13 @@ S3 values configured on the proxy. Use TLS at the ingress or load balancer in pr
 ## CI, dependency updates, and container images
 
 [GitHub Actions](.github/workflows/ci.yml) restores dependencies and runs the Release
-test suite on pull requests and branch pushes. The Docker image is built only after
-tests pass. Pull requests (including Dependabot and fork PRs) and non-default branches
-build without logging in or publishing.
+test suite on pushes to `main` and on pull requests. Changes that only touch files under
+`.github/` (workflows, Dependabot configuration) do not trigger it; a change that also
+touches any other file does. The Docker image is built only after tests pass. Pull
+requests (including Dependabot and fork PRs) and manual runs on other branches build
+without logging in or publishing. If you require the `Test` and `Build and publish
+image` checks in branch protection, a PR that only changes `.github/` files will wait
+on checks that never run, so temporarily adjust the rule or merge it as an admin.
 
 Manual execution is enabled for any branch through `workflow_dispatch`. In GitHub,
 open **Actions > CI > Run workflow**, select the desired branch in **Use workflow
@@ -117,26 +121,34 @@ the workflow with `workflow_dispatch` enabled. Alternatively, use the GitHub CLI
 gh workflow run ci.yml --ref <branch-name>
 ```
 
-Manual runs on non-default branches run the tests and Docker build without
+Manual runs on any branch other than `main` run the tests and Docker build without
 publishing an image.
 
-Pushes to the repository's default branch publish to GitHub Container Registry
-(GHCR) using the workflow's `GITHUB_TOKEN`; no registry password secret is required.
-Manual workflow runs publish only when run against the default branch. The image
+Images are published only from the `main` branch: pushes to `main` and manual runs
+started on `main` push to GitHub Container Registry (GHCR) using the workflow's
+`GITHUB_TOKEN`; no registry password secret is required. Pull requests and every other
+branch never log in to or push to the registry. The image
 name is `ghcr.io/<owner>/<repository>`, converted to lowercase, with these tags:
 
 - `0.1.0`: the first released version heading in [CHANGELOG.md](CHANGELOG.md).
-- `latest`: the most recent successful default-branch build.
+- `latest`: the most recent successful `main` build.
 - `sha-<full-commit-sha>`: a commit-specific tag for traceability.
 
+Each tag is a multi-architecture manifest covering `linux/amd64` and `linux/arm64`, so
+the same tag works on x64 and ARM64 (for example Raspberry Pi or Graviton/Ampere) nodes.
+The .NET build stage in the [Dockerfile](Dockerfile) always runs on the CI runner's
+native platform (`--platform=$BUILDPLATFORM`) and produces architecture-independent
+output, so no QEMU emulation is needed. Keep it that way: a `RUN` instruction in the
+final stage would run under emulation for the non-native platform and require
+`docker/setup-qemu-action` in the workflow.
 Keep changelog releases newest first, using `## [MAJOR.MINOR.PATCH] - YYYY-MM-DD`.
 An optional `## [Unreleased]` section is skipped. Missing or invalid release versions
 fail the image job rather than silently publishing an incorrect version.
 To change the version tag, add a new release heading and its release notes before
-merging to the default branch. For example, `## [0.2.0] - 2026-11-01` produces
+merging to `main`. For example, `## [0.2.0] - 2026-11-01` produces
 `ghcr.io/<owner>/<repository>:0.2.0`.
 
-Version and `latest` tags move on each default-branch publish, even if the changelog
+Version and `latest` tags move on each `main` publish, even if the changelog
 version has not changed. Use an image digest for immutable deployments; the SHA tag
 identifies the source commit but can also be overwritten by a workflow rerun.
 This workflow does not create Git tags or GitHub Releases. If release-only images

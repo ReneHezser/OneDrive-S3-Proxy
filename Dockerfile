@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY src/OneDriveS3Proxy/OneDriveS3Proxy.csproj src/OneDriveS3Proxy/
 RUN dotnet restore src/OneDriveS3Proxy/OneDriveS3Proxy.csproj
