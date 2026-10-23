@@ -85,6 +85,10 @@ moves its payload to the hash-addressed layout.
 
 ## Build and run
 
+The application and tests target .NET 10. Install the .NET 10 SDK for local builds.
+CI and the Docker build use the .NET 10 SDK, and the container uses the ASP.NET
+Core 10 runtime. Keep their major versions aligned with the target framework.
+
 ```powershell
 dotnet test .\OneDriveS3Proxy.sln --configuration Release
 docker build -t onedrive-s3-proxy:local .
@@ -161,6 +165,21 @@ Ensure GitHub Actions is enabled and repository or organization policies allow t
 workflow to write packages. GHCR packages may initially be private; adjust the
 package visibility for public pulls, or configure a Kubernetes image-pull secret
 for private images.
+
+[Cleanup SHA-only packages](.github/workflows/cleanup-packages.yml) runs after a
+successful publishing CI run on `main`, or manually from `main` using
+`gh workflow run cleanup-packages.yml --ref main`. It deletes image versions whose
+only tag is `sha-<full-commit-sha>`, without an age or retention limit. Versions with
+`latest`, release tags, other tags, or no tags are preserved; untagged
+multi-architecture components are not deleted. Old SHA-only image references will
+no longer be available to pull after cleanup. The workflow lists all version pages
+and rechecks each candidate's tags immediately before deleting it.
+
+Cleanup uses `GITHUB_TOKEN` with `packages: write`. The repository must have
+**Admin** access to the GHCR package to delete versions; check the package's
+**Manage Actions access** settings if cleanup fails with a permissions error.
+Packages published by this repository's workflow normally grant it admin access.
+Cleanup failures are reported separately and do not change the publishing CI result.
 
 [Dependabot](.github/dependabot.yml) checks NuGet packages in the solution, Docker
 base images, and GitHub Actions weekly. NuGet, Docker, and action updates are grouped by
