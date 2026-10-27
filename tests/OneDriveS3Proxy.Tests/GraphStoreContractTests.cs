@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
@@ -8,8 +9,54 @@ using OneDriveS3Proxy.Graph;
 
 namespace OneDriveS3Proxy.Tests;
 
-public sealed class GraphStoreContractTests
+public sealed class GraphStoreContractTests : IDisposable
 {
+    private readonly List<HttpClient> _clients = [];
+
+    public static TheoryData<int, bool, bool> UploadStreamCases
+    {
+        get
+        {
+            var cases = new TheoryData<int, bool, bool>();
+            foreach (var size in new[] { 1, 4 * 1024 * 1024, 4 * 1024 * 1024 + 1 })
+            {
+                foreach (var seekable in new[] { false, true })
+                {
+                    foreach (var multipart in new[] { false, true })
+                    {
+                        cases.Add(size, seekable, multipart);
+                    }
+                }
+            }
+
+            return cases;
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Dispose_DisposesClientsAndHandlersOnce(bool sharedHandler)
+    {
+        var graphHandler = new DisposalTrackingHandler();
+        var monitorHandler = sharedHandler ? graphHandler : new DisposalTrackingHandler();
+        CreateStore(graphHandler, monitorHandler);
+        var clients = _clients.ToArray();
+
+        Dispose();
+        Dispose();
+
+        Assert.Equal(2, clients.Length);
+        Assert.Empty(_clients);
+        Assert.Equal(1, graphHandler.DisposeCount);
+        Assert.Equal(1, monitorHandler.DisposeCount);
+        foreach (var client in clients)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/");
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => client.SendAsync(request));
+        }
+    }
+
     [Fact]
     public void ObjectPaths_PreserveOriginalKeys()
     {
@@ -46,6 +93,72 @@ public sealed class GraphStoreContractTests
         Assert.Contains(handler.Requests, request => request.Method == "DELETE" &&
             request.Uri.AbsolutePath.Contains("/drive/items/", StringComparison.Ordinal));
         Assert.Empty(await store.ListObjectsAsync("bucket", CancellationToken.None));
+    }
+
+    [Theory]
+    [MemberData(nameof(UploadStreamCases))]
+    public async Task Uploads_LeaveCallerStreamsOpenAfterSuccess(int size, bool seekable, bool multipart)
+    {
+        var handler = new ListingHandler();
+        var store = CreateStore(handler, handler);
+        var payload = new byte[size + 1];
+        payload[0] = 42;
+        payload[^1] = 7;
+        using var content = new UploadTestStream(payload, seekable);
+        Assert.Equal(42, content.ReadByte());
+
+        await UploadAsync(store, content, size, multipart, CancellationToken.None);
+
+        Assert.True(content.CanRead);
+        Assert.Equal(payload.LongLength, content.BytesRead);
+        Assert.Equal(-1, content.ReadByte());
+        if (seekable)
+        {
+            Assert.Equal(payload.LongLength, content.Position);
+        }
+
+        Assert.Equal(size > 4 * 1024 * 1024 ? (multipart ? 2 : 1) : 0, handler.UploadSessions);
+        await using var download = await store.GetObjectAsync("bucket", "stream.bin", null, CancellationToken.None);
+        Assert.Equal(payload[1..], await download.Response.Content.ReadAsByteArrayAsync());
+    }
+
+    [Theory]
+    [MemberData(nameof(UploadStreamCases))]
+    public async Task Uploads_LeaveCallerStreamsOpenAfterGraphFailure(int size, bool seekable, bool multipart)
+    {
+        var handler = new FailingUploadHandler(new ListingHandler());
+        var store = CreateStore(handler, handler);
+        using var content = new UploadTestStream(new byte[size], seekable);
+
+        var exception = await Assert.ThrowsAsync<GraphStoreException>(() =>
+            UploadAsync(store, content, size, multipart, CancellationToken.None));
+
+        Assert.Equal(503, exception.StatusCode);
+        Assert.True(content.BytesRead > 0);
+        Assert.True(content.CanRead);
+        Assert.Equal(-1, content.ReadByte());
+    }
+
+    [Theory]
+    [MemberData(nameof(UploadStreamCases))]
+    public async Task Uploads_LeaveCallerStreamsOpenAfterCancellation(int size, bool seekable, bool multipart)
+    {
+        var handler = new ListingHandler();
+        var store = CreateStore(handler, handler);
+        using var cancellation = new CancellationTokenSource();
+        using var content = new UploadTestStream(new byte[size], seekable)
+        {
+            BeforeRead = cancellation.Cancel
+        };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            UploadAsync(store, content, size, multipart, cancellation.Token));
+
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.True(content.ReadAttempts > 0);
+        Assert.True(content.CanRead);
+        content.BeforeRead = null;
+        Assert.Equal(0, content.ReadByte());
     }
 
     [Theory]
@@ -181,15 +294,27 @@ public sealed class GraphStoreContractTests
         Assert.False(handler.HasPath("S3/bucket/nested/file.txt"));
     }
 
-    [Fact]
-    public async Task LargeUploads_UseSessionsAndCompleteAtTheDirectKeyPath()
+    [Theory]
+    [InlineData(4 * 1024 * 1024 + 1, false)]
+    [InlineData(5 * 1024 * 1024, false)]
+    [InlineData(10 * 1024 * 1024 + 37, false)]
+    [InlineData(5 * 1024 * 1024, true)]
+    public async Task LargeUploads_UseSessionsAndCompleteAtTheDirectKeyPath(int size, bool overwrite)
     {
         var handler = new ListingHandler();
+        if (overwrite)
+        {
+            handler.AddDirectObject("bucket", "large/block.blk", [1]);
+        }
+
         var store = CreateStore(handler, handler);
-        var payload = new byte[4 * 1024 * 1024 + 1];
+        var payload = new byte[size];
         payload[^1] = 7;
 
-        await store.PutObjectAsync("bucket", "large/block.blk", new MemoryStream(payload), payload.Length, CancellationToken.None);
+        using (var payloadStream = new MemoryStream(payload))
+        {
+            await store.PutObjectAsync("bucket", "large/block.blk", payloadStream, payload.Length, CancellationToken.None);
+        }
 
         Assert.Equal(1, handler.UploadSessions);
         Assert.True(handler.HasPath("S3/bucket/large/block.blk"));
@@ -197,23 +322,35 @@ public sealed class GraphStoreContractTests
         Assert.Equal(payload, await download.Response.Content.ReadAsByteArrayAsync());
     }
 
-    [Fact]
-    public async Task MultipartCompletion_WritesTheOriginalKeyAndPreservesMetadata()
+    [Theory]
+    [InlineData(3)]
+    [InlineData(5 * 1024 * 1024)]
+    [InlineData(10 * 1024 * 1024 + 37)]
+    public async Task MultipartCompletion_WritesTheOriginalKeyAndPreservesMetadata(int size)
     {
         var handler = new ListingHandler();
         var store = CreateStore(handler, handler);
         var state = new ObjectState { ContentType = "application/test", Metadata = new() { ["source"] = "backup" } };
+        var payload = new byte[size];
+        payload[^1] = 7;
+        using var content = new MemoryStream(payload);
         var upload = await store.CreateMultipartUploadAsync("bucket", "nested/backup.blk", state, CancellationToken.None);
         var part = await store.PutPartAsync(
-            "bucket", "nested/backup.blk", upload.UploadId, 1, new MemoryStream([1, 2, 3]), 3, CancellationToken.None);
+            "bucket", "nested/backup.blk", upload.UploadId, 1, content, payload.Length, CancellationToken.None);
+
+        Assert.Equal(Convert.ToHexString(MD5.HashData(payload)).ToLowerInvariant(), part.ETag);
+        Assert.True(content.CanRead);
 
         await store.CompleteMultipartUploadAsync("bucket", "nested/backup.blk", upload.UploadId, [part], CancellationToken.None);
 
         Assert.True(handler.HasPath("S3/bucket/nested/backup.blk"));
         Assert.False(handler.HasPath($"S3/.onedrive-s3-proxy-state/multipart/bucket/{upload.UploadId}"));
+        Assert.Equal(size > 4 * 1024 * 1024 ? 2 : 0, handler.UploadSessions);
         var savedState = await store.GetObjectStateAsync("bucket", "nested/backup.blk", CancellationToken.None);
         Assert.Equal("application/test", savedState.ContentType);
         Assert.Equal("backup", savedState.Metadata["source"]);
+        await using var download = await store.GetObjectAsync("bucket", "nested/backup.blk", null, CancellationToken.None);
+        Assert.Equal(payload, await download.Response.Content.ReadAsByteArrayAsync());
     }
 
     [Fact]
@@ -478,7 +615,36 @@ public sealed class GraphStoreContractTests
         Assert.Equal(1, handler.DriveRequests);
     }
 
-    private static OneDriveStore CreateStore(
+    public void Dispose()
+    {
+        foreach (var client in _clients)
+        {
+            client.Dispose();
+        }
+
+        _clients.Clear();
+    }
+
+    private static async Task UploadAsync(
+        OneDriveStore store,
+        Stream content,
+        long length,
+        bool multipart,
+        CancellationToken cancellationToken)
+    {
+        if (!multipart)
+        {
+            await store.PutObjectAsync("bucket", "stream.bin", content, length, cancellationToken);
+            return;
+        }
+
+        var upload = await store.CreateMultipartUploadAsync("bucket", "stream.bin", new ObjectState(), cancellationToken);
+        var part = await store.PutPartAsync(
+            "bucket", "stream.bin", upload.UploadId, 1, content, length, cancellationToken);
+        await store.CompleteMultipartUploadAsync("bucket", "stream.bin", upload.UploadId, [part], cancellationToken);
+    }
+
+    private OneDriveStore CreateStore(
         HttpMessageHandler graphHandler,
         HttpMessageHandler monitorHandler)
     {
@@ -486,7 +652,9 @@ public sealed class GraphStoreContractTests
         {
             BaseAddress = new Uri("https://graph.microsoft.com/v1.0/")
         };
-        var monitorClient = new HttpClient(monitorHandler);
+        _clients.Add(graphClient);
+        var monitorClient = new HttpClient(monitorHandler, disposeHandler: !ReferenceEquals(graphHandler, monitorHandler));
+        _clients.Add(monitorClient);
         return new OneDriveStore(
             graphClient,
             new TestHttpClientFactory(monitorClient),
@@ -511,6 +679,110 @@ public sealed class GraphStoreContractTests
                     Region = "us-east-1"
                 }
             }));
+    }
+
+    private sealed class UploadTestStream(byte[] content, bool seekable) : Stream
+    {
+        private readonly MemoryStream _inner = new(content);
+
+        public Action? BeforeRead { get; set; }
+        public int ReadAttempts { get; private set; }
+        public long BytesRead { get; private set; }
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => seekable && _inner.CanSeek;
+        public override bool CanWrite => false;
+        public override long Length => seekable ? _inner.Length : throw new NotSupportedException();
+        public override long Position
+        {
+            get => seekable ? _inner.Position : throw new NotSupportedException();
+            set
+            {
+                if (!seekable)
+                {
+                    throw new NotSupportedException();
+                }
+
+                _inner.Position = value;
+            }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            ReadAttempts++;
+            BeforeRead?.Invoke();
+            var read = _inner.Read(buffer, offset, count);
+            BytesRead += read;
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            ReadAttempts++;
+            BeforeRead?.Invoke();
+            var read = await _inner.ReadAsync(buffer, cancellationToken);
+            BytesRead += read;
+            return read;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) =>
+            seekable ? _inner.Seek(offset, origin) : throw new NotSupportedException();
+
+        public override void Flush() => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class FailingUploadHandler(HttpMessageHandler inner) : DelegatingHandler(inner)
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Put &&
+                request.Content is { } content &&
+                (content.Headers.ContentRange is not null ||
+                 path.EndsWith(".bin:/content", StringComparison.Ordinal) ||
+                 path.EndsWith(".bin/content", StringComparison.Ordinal)))
+            {
+                await content.CopyToAsync(Stream.Null, cancellationToken);
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+            }
+
+            return await base.SendAsync(request, cancellationToken);
+        }
+    }
+
+    private sealed class DisposalTrackingHandler : HttpMessageHandler
+    {
+        public int DisposeCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("A disposed client must not send requests.");
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                DisposeCount++;
+            }
+
+            base.Dispose(disposing);
+        }
     }
 
     private sealed class TestTokenProvider : IGraphTokenProvider
@@ -746,6 +1018,21 @@ public sealed class GraphStoreContractTests
             }
         }
 
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                foreach (var upload in _uploads.Values)
+                {
+                    upload.Content.Dispose();
+                }
+
+                _uploads.Clear();
+            }
+
+            base.Dispose(disposing);
+        }
+
         protected override async Task<HttpResponseMessage> RespondAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
@@ -810,7 +1097,16 @@ public sealed class GraphStoreContractTests
                 var path = rest[..^suffix.Length];
                 BeforeUpload?.Invoke();
                 using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
-                var behavior = body.RootElement.GetProperty("item").GetProperty("@microsoft.graph.conflictBehavior").GetString();
+                var uploadProperties = body.RootElement.GetProperty("item");
+                if (uploadProperties.TryGetProperty("name", out _))
+                {
+                    return Json(HttpStatusCode.BadRequest, new
+                    {
+                        error = new { code = "invalidRequest", message = "Upload sessions must use the destination name from the URL." }
+                    });
+                }
+
+                var behavior = uploadProperties.GetProperty("@microsoft.graph.conflictBehavior").GetString();
                 if (FindPath(path) is not null && behavior == "fail")
                 {
                     return new HttpResponseMessage(HttpStatusCode.Conflict);
