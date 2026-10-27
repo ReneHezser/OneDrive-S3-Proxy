@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-10-27
+
+### Fixed
+
+- Omit the redundant `item.name` property from Graph upload-session requests, which
+  OneDrive for Business can reject with HTTP 400 `invalidRequest`. This fixes
+  uploads larger than 4 MiB, including Barman/PostgreSQL multipart backup parts,
+  while preserving existing conflict and overwrite behavior.
+
 ## [0.1.4] - 2026-10-23
 
 ### Fixed

@@ -165,6 +165,7 @@ public sealed class OneDriveStore(
         return false;
     }
 
+    /// <inheritdoc />
     public async Task<ObjectInfo> PutObjectAsync(
         string bucket,
         string key,
@@ -366,6 +367,7 @@ public sealed class OneDriveStore(
         return upload;
     }
 
+    /// <inheritdoc />
     public async Task<UploadedPart> PutPartAsync(
         string bucket,
         string key,
@@ -382,7 +384,7 @@ public sealed class OneDriveStore(
         }
 
         var storageName = $"{partNumber:D5}-{Guid.NewGuid():N}.bin";
-        var hashingStream = new HashingReadStream(content);
+        using var hashingStream = new HashingReadStream(content);
         await UploadFileAsync(
             MultipartPartPath(bucket, uploadId, storageName),
             hashingStream,
@@ -682,7 +684,7 @@ public sealed class OneDriveStore(
         resourcePath ??= $"{ItemPath(path)}:";
         if (length <= SimpleUploadLimit)
         {
-            using var body = new StreamContent(content);
+            using var body = new StreamContent(new LeaveOpenReadStream(content));
             body.Headers.ContentLength = length;
             body.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
             using var response = await SendAsync(
@@ -695,12 +697,10 @@ public sealed class OneDriveStore(
                 ?? throw new GraphStoreException(502, "Microsoft Graph returned an empty upload response.");
         }
 
-        var fileName = path.Split('/').Last();
         using var sessionBody = JsonContent.Create(new Dictionary<string, object>
         {
             ["item"] = new Dictionary<string, object>
             {
-                ["name"] = fileName,
                 ["@microsoft.graph.conflictBehavior"] = createOnly ? "fail" : "replace"
             }
         });
@@ -1131,10 +1131,43 @@ public sealed class OneDriveStore(
         return total;
     }
 
+    // Stream's default disposal leaves the underlying caller-owned stream open.
+    private sealed class LeaveOpenReadStream(Stream inner) : Stream
+    {
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => inner.CanSeek;
+        public override bool CanWrite => false;
+        public override long Length => inner.Length;
+        public override long Position { get => inner.Position; set => inner.Position = value; }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            inner.Read(buffer, offset, count);
+
+        public override int Read(Span<byte> buffer) => inner.Read(buffer);
+
+        public override Task<int> ReadAsync(
+            byte[] buffer,
+            int offset,
+            int count,
+            CancellationToken cancellationToken) =>
+            inner.ReadAsync(buffer, offset, count, cancellationToken);
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default) =>
+            inner.ReadAsync(buffer, cancellationToken);
+
+        public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+        public override void Flush() => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     private sealed class HashingReadStream(Stream inner) : Stream
     {
         private readonly IncrementalHash _hash = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
         private byte[]? _completedHash;
+        private bool _disposed;
 
         public override bool CanRead => inner.CanRead;
         public override bool CanSeek => false;
@@ -1144,12 +1177,7 @@ public sealed class OneDriveStore(
 
         public string GetHash()
         {
-            if (_completedHash is null)
-            {
-                _completedHash = _hash.GetHashAndReset();
-                _hash.Dispose();
-            }
-
+            _completedHash ??= _hash.GetHashAndReset();
             return Convert.ToHexString(_completedHash).ToLowerInvariant();
         }
 
@@ -1174,7 +1202,17 @@ public sealed class OneDriveStore(
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
-        protected override void Dispose(bool disposing) => base.Dispose(disposing);
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !_disposed)
+            {
+                _completedHash ??= _hash.GetHashAndReset();
+                _hash.Dispose();
+                _disposed = true;
+            }
+
+            base.Dispose(disposing);
+        }
     }
 
     private sealed class MultipartReadStream(
