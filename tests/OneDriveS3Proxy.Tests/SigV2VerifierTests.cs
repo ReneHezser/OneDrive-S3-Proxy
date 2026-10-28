@@ -307,6 +307,23 @@ public sealed class SigV2VerifierTests
         }
     }
 
+    [Fact]
+    public async Task VerifyAsync_RejectsAppendedBytesReadAfterContentLength()
+    {
+        var request = CreateRequest("PUT");
+        var payload = "payload"u8.ToArray();
+        request.ContentLength = payload.Length;
+        request.Body = new MemoryStream("payload-extra"u8.ToArray());
+        request.Headers["Content-MD5"] = Convert.ToBase64String(MD5.HashData(payload));
+        Sign(request, $"{request.Headers.Date}\n/bucket/object.txt");
+
+        await CreateVerifier().VerifyAsync(request, CancellationToken.None);
+
+        Assert.Equal(payload.Length, await request.Body.ReadAsync(new byte[payload.Length].AsMemory()));
+        await Assert.ThrowsAsync<AuthenticationException>(async () =>
+            await request.Body.CopyToAsync(Stream.Null));
+    }
+
     [Theory]
     [InlineData("invalid")]
     [InlineData("c2hvcnQ=")]

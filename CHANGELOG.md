@@ -10,6 +10,11 @@ All notable changes to this project will be documented in this file.
   including Authorization headers, presigned URLs, and streaming Content-MD5
   validation, using the existing S3 access and secret keys alongside SigV4.
 
+### Fixed
+
+- Reject signed payloads that exceed Content-Length or end before it, including
+  additional reads after the declared length's payload hash has been validated.
+
 ## [0.1.5] - 2026-10-27
 
 ### Fixed

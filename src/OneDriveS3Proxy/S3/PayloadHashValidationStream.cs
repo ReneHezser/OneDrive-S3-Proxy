@@ -23,7 +23,7 @@ internal sealed class PayloadHashValidationStream(
     public override int Read(byte[] buffer, int offset, int count)
     {
         var read = inner.Read(buffer, offset, count);
-        ValidateRead(buffer.AsSpan(offset, read), read);
+        ValidateRead(buffer.AsSpan(offset, read), count);
         return read;
     }
 
@@ -32,7 +32,7 @@ internal sealed class PayloadHashValidationStream(
         CancellationToken cancellationToken = default)
     {
         var read = await inner.ReadAsync(buffer, cancellationToken);
-        ValidateRead(buffer.Span[..read], read);
+        ValidateRead(buffer.Span[..read], buffer.Length);
         return read;
     }
 
@@ -51,20 +51,37 @@ internal sealed class PayloadHashValidationStream(
         base.Dispose(disposing);
     }
 
-    private void ValidateRead(ReadOnlySpan<byte> value, int count)
+    private void ValidateRead(ReadOnlySpan<byte> value, int requestedCount)
     {
-        if (_validated)
+        if (requestedCount == 0)
         {
             return;
         }
 
-        if (count > 0)
+        _bytesRead += value.Length;
+        if (expectedLength is { } length &&
+            (_bytesRead > length || value.IsEmpty && _bytesRead != length))
         {
-            _hash.AppendData(value);
-            _bytesRead += count;
+            throw new AuthenticationException("The request payload length does not match Content-Length.");
         }
 
-        if (count == 0 || expectedLength is not null && _bytesRead == expectedLength)
+        if (_validated)
+        {
+            if (!value.IsEmpty)
+            {
+                throw new AuthenticationException("The request body contains bytes beyond the authenticated payload.");
+            }
+
+            return;
+        }
+
+        if (!value.IsEmpty)
+        {
+            _hash.AppendData(value);
+        }
+
+        // Upload sessions can stop reading at Content-Length without requesting EOF.
+        if (value.IsEmpty || expectedLength is not null && _bytesRead == expectedLength)
         {
             var actualHash = _hash.GetHashAndReset();
             _hash.Dispose();
