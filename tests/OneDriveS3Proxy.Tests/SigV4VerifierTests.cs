@@ -33,6 +33,21 @@ public sealed class SigV4VerifierTests
     }
 
     [Fact]
+    public async Task VerifyAsync_RejectsAppendedBytesReadAfterContentLength()
+    {
+        var request = CreateSignedRequest("payload");
+        var buffer = new byte[7];
+        request.ContentLength = buffer.Length;
+        request.Body = new MemoryStream("payload-extra"u8.ToArray());
+
+        await CreateVerifier().VerifyAsync(request, CancellationToken.None);
+
+        Assert.Equal(buffer.Length, await request.Body.ReadAsync(buffer.AsMemory()));
+        await Assert.ThrowsAsync<AuthenticationException>(async () =>
+            await request.Body.CopyToAsync(Stream.Null));
+    }
+
+    [Fact]
     public async Task VerifyAsync_RejectsWrongAccessKey()
     {
         var request = CreateSignedRequest("payload", "other-access");
