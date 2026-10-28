@@ -55,7 +55,9 @@ public sealed class SigV4Verifier(IOptions<ProxyOptions> options)
 
         if (payloadHash != "UNSIGNED-PAYLOAD")
         {
-            request.Body = new PayloadHashValidationStream(request.Body, payloadHash, request.ContentLength);
+            request.Body = new PayloadHashValidationStream(
+                request.Body, HashAlgorithmName.SHA256, Convert.FromHexString(payloadHash), request.ContentLength,
+                "The request payload hash does not match x-amz-content-sha256.");
         }
 
         return Task.CompletedTask;
@@ -269,62 +271,4 @@ public sealed class SigV4Verifier(IOptions<ProxyOptions> options)
         string Signature,
         string AmzDate,
         int? Expires);
-
-    private sealed class PayloadHashValidationStream(
-        Stream inner,
-        string expectedHash,
-        long? expectedLength) : Stream
-    {
-        private readonly IncrementalHash _hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        private long _bytesRead;
-        private bool _validated;
-
-        public override bool CanRead => inner.CanRead;
-        public override bool CanSeek => false;
-        public override bool CanWrite => false;
-        public override long Length => inner.Length;
-        public override long Position { get => inner.Position; set => throw new NotSupportedException(); }
-
-        public override int Read(byte[] buffer, int offset, int count)
-        {
-            var read = inner.Read(buffer, offset, count);
-            ValidateRead(buffer.AsSpan(offset, read), read);
-            return read;
-        }
-
-        public override async ValueTask<int> ReadAsync(
-            Memory<byte> buffer,
-            CancellationToken cancellationToken = default)
-        {
-            var read = await inner.ReadAsync(buffer, cancellationToken);
-            ValidateRead(buffer.Span[..read], read);
-            return read;
-        }
-
-        public override void Flush() => inner.Flush();
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-        public override void SetLength(long value) => throw new NotSupportedException();
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-        private void ValidateRead(ReadOnlySpan<byte> value, int count)
-        {
-            if (count > 0)
-            {
-                _hash.AppendData(value);
-                _bytesRead += count;
-            }
-
-            if (!_validated && (count == 0 || expectedLength is not null && _bytesRead == expectedLength))
-            {
-                var actualHash = Convert.ToHexString(_hash.GetHashAndReset()).ToLowerInvariant();
-                _hash.Dispose();
-                _validated = true;
-                if (!FixedTimeHexEquals(expectedHash, actualHash))
-                {
-                    throw new AuthenticationException(
-                        "The request payload hash does not match x-amz-content-sha256.");
-                }
-            }
-        }
-    }
 }

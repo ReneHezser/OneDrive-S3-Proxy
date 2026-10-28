@@ -11,7 +11,7 @@ Graph access token for the process lifetime.
 
 ## Supported API
 
-- AWS Signature Version 4 header and presigned URL authentication
+- AWS Signature Versions 2 and 4 header and presigned URL authentication
 - List, create, head, and delete buckets
 - ListObjects (v1 `marker`) and ListObjectsV2 with `prefix`, `delimiter`, `max-keys`,
   `start-after`, and continuation tokens
@@ -29,13 +29,30 @@ Uploads require `Content-Length`.
 The default 238,000 MiB limit stays below OneDrive's 250 GB file limit and can be
 reduced with configuration.
 
-Requests must sign the `host` header and every `x-amz-*` header they send (other than
+SigV4 requests must sign the `host` header and every `x-amz-*` header they send (other than
 `x-amz-date` and `x-amz-content-sha256`, which are bound by the signature itself).
-Header-signed requests must be within 15 minutes of the server clock; presigned URLs
+SigV4 header-signed requests must be within 15 minutes of the server clock; presigned URLs
 are accepted from 15 minutes before their signing time until they expire. The
 `/health/live` and `/health/ready` GET probes are the only unauthenticated paths.
 The proxy refuses to start when the Entra, OneDrive, or S3 settings (including the
 access and secret keys) are missing.
+
+### Legacy SigV2 clients
+
+SigV2 is detected automatically and uses the same `S3__AccessKey` and `S3__SecretKey`
+as SigV4; no additional configuration is needed. It supports:
+
+- `Authorization: AWS <access-key>:<base64-hmac-sha1-signature>` with a `Date` or
+  `x-amz-date` header within 15 minutes of the server clock.
+- Presigned URLs with `AWSAccessKeyId`, `Signature`, and `Expires` (a Unix timestamp
+  in seconds). The signature must be URL-encoded and the URL is rejected after expiry.
+- Canonicalized `x-amz-*` headers and S3 subresources, including multipart uploads
+  and tagging. A supplied `Content-MD5` is signed and validated while reading the body.
+
+Both versions require path-style bucket addressing. Do not mix header and query
+authentication or SigV2 and SigV4 credentials in the same request. Prefer SigV4 for
+new clients. SigV2 uses legacy HMAC-SHA1 and does not sign most listing query
+parameters or protect the body when `Content-MD5` is absent; use HTTPS.
 
 ## Entra setup
 

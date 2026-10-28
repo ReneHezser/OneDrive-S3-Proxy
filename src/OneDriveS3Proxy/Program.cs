@@ -51,11 +51,13 @@ builder.Services.AddSingleton<IOneDriveStore>(services =>
         services.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProxyOptions>>());
 });
 builder.Services.AddSingleton<SigV4Verifier>();
+builder.Services.AddSingleton<SigV2Verifier>();
+builder.Services.AddSingleton(TimeProvider.System);
 
 var app = builder.Build();
 
 app.UseMiddleware<S3ExceptionMiddleware>();
-app.UseMiddleware<SigV4AuthenticationMiddleware>();
+app.UseMiddleware<S3AuthenticationMiddleware>();
 
 app.MapGet("/health/live", () => Results.Ok(new { status = "live" }));
 app.MapGet("/health/ready", async (IOneDriveStore store, HttpContext context) =>
