@@ -4,6 +4,10 @@ using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Xml.Linq;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using OneDriveS3Proxy.Graph;
 
@@ -96,6 +100,164 @@ public sealed class GraphStoreContractTests : IDisposable
     }
 
     [Theory]
+    [InlineData(0, false)]
+    [InlineData(3, false)]
+    [InlineData(4 * 1024 * 1024 + 1, false)]
+    [InlineData(10 * 1024 * 1024 + 37, false)]
+    [InlineData(3, true)]
+    [InlineData(4 * 1024 * 1024 + 1, true)]
+    public async Task S3Uploads_PersistMd5ETagsAcrossReadsListingsAndRestart(int size, bool sigV4)
+    {
+        var handler = new ListingHandler();
+        var store = CreateStore(handler, handler);
+        await using var factory = new LonghornProxyFactory();
+        await using var proxy = factory.WithWebHostBuilder(builder => builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IOneDriveStore>();
+            services.AddSingleton<IOneDriveStore>(store);
+        }));
+        using var client = proxy.CreateClient();
+        var payload = new byte[size];
+        if (size > 0)
+        {
+            payload[^1] = 7;
+        }
+
+        var etag = Convert.ToHexString(MD5.HashData(payload)).ToLowerInvariant();
+        using var put = await SendS3Async(client, HttpMethod.Put, "/bucket/backup.bin", payload, sigV4: sigV4);
+        Assert.Equal(HttpStatusCode.OK, put.StatusCode);
+        Assert.Equal($"\"{etag}\"", put.Headers.ETag?.Tag);
+
+        foreach (var method in new[] { HttpMethod.Head, HttpMethod.Get })
+        {
+            using var read = await SendS3Async(client, method, "/bucket/backup.bin", sigV4: sigV4);
+            Assert.Equal(HttpStatusCode.OK, read.StatusCode);
+            Assert.Equal(put.Headers.ETag, read.Headers.ETag);
+            if (method == HttpMethod.Get)
+            {
+                Assert.Equal(payload, await read.Content.ReadAsByteArrayAsync());
+            }
+        }
+
+        foreach (var query in new[] { "", "?list-type=2" })
+        {
+            using var list = await SendS3Async(client, HttpMethod.Get, "/bucket" + query, sigV4: sigV4);
+            Assert.Equal(HttpStatusCode.OK, list.StatusCode);
+            Assert.Equal($"\"{etag}\"", XDocument.Parse(await list.Content.ReadAsStringAsync())
+                .Descendants().Single(element => element.Name.LocalName == "ETag").Value);
+        }
+
+        var restarted = CreateStore(handler, handler);
+        Assert.Equal(etag, (await restarted.GetObjectInfoAsync("bucket", "backup.bin", CancellationToken.None)).ETag);
+        Assert.Equal(etag, Assert.Single(await restarted.ListObjectsAsync("bucket", CancellationToken.None)).ETag);
+        var state = await restarted.GetObjectStateAsync("bucket", "backup.bin", CancellationToken.None);
+        Assert.Equal(etag, state.ETag);
+        Assert.NotEqual(etag, state.StorageETag);
+        Assert.Equal("application/test", state.ContentType);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task S3CopiesAndMetadataChanges_PreserveETags(bool replaceMetadata)
+    {
+        var handler = new ListingHandler();
+        var store = CreateStore(handler, handler);
+        await using var factory = new LonghornProxyFactory();
+        await using var proxy = factory.WithWebHostBuilder(builder => builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IOneDriveStore>();
+            services.AddSingleton<IOneDriveStore>(store);
+        }));
+        using var client = proxy.CreateClient();
+        var payload = "backup content"u8.ToArray();
+        var etag = $"\"{Convert.ToHexString(MD5.HashData(payload)).ToLowerInvariant()}\"";
+        using var put = await SendS3Async(client, HttpMethod.Put, "/bucket/source.bin", payload);
+        Assert.Equal(HttpStatusCode.OK, put.StatusCode);
+
+        using var tags = await SendS3Async(client, HttpMethod.Put, "/bucket/source.bin?tagging",
+            "<Tagging><TagSet><Tag><Key>client</Key><Value>qnap</Value></Tag></TagSet></Tagging>"u8.ToArray());
+        Assert.Equal(HttpStatusCode.OK, tags.StatusCode);
+
+        using var copy = await SendS3Async(client, HttpMethod.Put, "/bucket/copied.bin", headers: new()
+        {
+            ["x-amz-copy-source"] = "/bucket/source.bin",
+            ["x-amz-metadata-directive"] = replaceMetadata ? "REPLACE" : "COPY"
+        });
+        Assert.Equal(HttpStatusCode.OK, copy.StatusCode);
+        Assert.Equal(etag, XDocument.Parse(await copy.Content.ReadAsStringAsync())
+            .Descendants().Single(element => element.Name.LocalName == "ETag").Value);
+        using var copiedHead = await SendS3Async(client, HttpMethod.Head, "/bucket/copied.bin");
+        Assert.Equal(etag, copiedHead.Headers.ETag?.Tag);
+        var copiedState = await store.GetObjectStateAsync("bucket", "copied.bin", CancellationToken.None);
+        Assert.Equal(replaceMetadata ? "application/octet-stream" : "application/test", copiedState.ContentType);
+        Assert.Equal("qnap", copiedState.Tags["client"]);
+
+        using var selfCopy = await SendS3Async(client, HttpMethod.Put, "/bucket/copied.bin", headers: new()
+        {
+            ["x-amz-copy-source"] = "/bucket/copied.bin",
+            ["x-amz-metadata-directive"] = "REPLACE",
+            ["x-amz-meta-owner"] = "archive"
+        });
+        Assert.Equal(HttpStatusCode.OK, selfCopy.StatusCode);
+        using var deleteTags = await SendS3Async(client, HttpMethod.Delete, "/bucket/copied.bin?tagging");
+        Assert.Equal(HttpStatusCode.NoContent, deleteTags.StatusCode);
+        using var head = await SendS3Async(client, HttpMethod.Head, "/bucket/copied.bin");
+        Assert.Equal(etag, head.Headers.ETag?.Tag);
+        Assert.Equal("archive", Assert.Single(head.Headers.GetValues("x-amz-meta-owner")));
+
+        using var overwrite = await SendS3Async(client, HttpMethod.Put, "/bucket/source.bin", "new content"u8.ToArray());
+        Assert.Equal(HttpStatusCode.OK, overwrite.StatusCode);
+        Assert.NotEqual(etag, overwrite.Headers.ETag?.Tag);
+        using var overwrittenHead = await SendS3Async(client, HttpMethod.Head, "/bucket/source.bin");
+        Assert.Equal(overwrite.Headers.ETag, overwrittenHead.Headers.ETag);
+        Assert.NotEqual(overwrite.Headers.ETag, head.Headers.ETag);
+    }
+
+    [Fact]
+    public async Task S3Upload_DoesNotAcknowledgeFailedETagPersistence()
+    {
+        var handler = new ListingHandler { StateWriteFailures = 3 };
+        var store = CreateStore(handler, handler);
+        await using var factory = new LonghornProxyFactory();
+        await using var proxy = factory.WithWebHostBuilder(builder => builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IOneDriveStore>();
+            services.AddSingleton<IOneDriveStore>(store);
+        }));
+        using var client = proxy.CreateClient();
+
+        using var put = await SendS3Async(client, HttpMethod.Put, "/bucket/backup.bin", [1, 2, 3]);
+
+        Assert.Equal(HttpStatusCode.BadGateway, put.StatusCode);
+        Assert.Contains("<Code>InternalError</Code>", await put.Content.ReadAsStringAsync());
+        Assert.Null(put.Headers.ETag);
+        Assert.Equal(0, handler.StateWriteFailures);
+    }
+
+    [Fact]
+    public async Task ObjectETags_KeepLegacyTagsAndRejectStaleChecksums()
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backup.bin", [1, 2, 3]);
+        var store = CreateStore(handler, handler);
+        var original = await store.GetObjectInfoAsync("bucket", "backup.bin", CancellationToken.None);
+        await store.PutObjectStateAsync("bucket", "backup.bin", new ObjectState
+        {
+            ETag = Convert.ToHexString(MD5.HashData([1, 2, 3])).ToLowerInvariant(),
+            StorageETag = original.StorageETag
+        }, CancellationToken.None);
+        handler.AddDirectObject("bucket", "backup.bin", [4, 5, 6]);
+
+        var current = await store.GetObjectInfoAsync("bucket", "backup.bin", CancellationToken.None);
+        Assert.NotEqual(original.ETag, current.ETag);
+        Assert.Equal(current.StorageETag, current.ETag);
+        Assert.Equal(current.ETag, Assert.Single(await store.ListObjectsAsync("bucket", CancellationToken.None)).ETag);
+        await using var download = await store.GetObjectAsync("bucket", "backup.bin", null, CancellationToken.None);
+        Assert.Equal(current.ETag, download.Info.ETag);
+    }
+
+    [Theory]
     [MemberData(nameof(UploadStreamCases))]
     public async Task Uploads_LeaveCallerStreamsOpenAfterSuccess(int size, bool seekable, bool multipart)
     {
@@ -107,8 +269,13 @@ public sealed class GraphStoreContractTests : IDisposable
         using var content = new UploadTestStream(payload, seekable);
         Assert.Equal(42, content.ReadByte());
 
-        await UploadAsync(store, content, size, multipart, CancellationToken.None);
+        var uploaded = await UploadAsync(store, content, size, multipart, CancellationToken.None);
 
+        var md5 = MD5.HashData(payload[1..]);
+        var etag = multipart
+            ? $"{Convert.ToHexString(MD5.HashData(md5)).ToLowerInvariant()}-1"
+            : Convert.ToHexString(md5).ToLowerInvariant();
+        Assert.Equal(etag, uploaded.ETag);
         Assert.True(content.CanRead);
         Assert.Equal(payload.LongLength, content.BytesRead);
         Assert.Equal(-1, content.ReadByte());
@@ -341,16 +508,49 @@ public sealed class GraphStoreContractTests : IDisposable
         Assert.Equal(Convert.ToHexString(MD5.HashData(payload)).ToLowerInvariant(), part.ETag);
         Assert.True(content.CanRead);
 
-        await store.CompleteMultipartUploadAsync("bucket", "nested/backup.blk", upload.UploadId, [part], CancellationToken.None);
+        var completed = await store.CompleteMultipartUploadAsync(
+            "bucket", "nested/backup.blk", upload.UploadId, [part], CancellationToken.None);
+        var etag = $"{Convert.ToHexString(MD5.HashData(MD5.HashData(payload))).ToLowerInvariant()}-1";
+        Assert.Equal(etag, completed.ETag);
 
         Assert.True(handler.HasPath("S3/bucket/nested/backup.blk"));
         Assert.False(handler.HasPath($"S3/.onedrive-s3-proxy-state/multipart/bucket/{upload.UploadId}"));
         Assert.Equal(size > 4 * 1024 * 1024 ? 2 : 0, handler.UploadSessions);
         var savedState = await store.GetObjectStateAsync("bucket", "nested/backup.blk", CancellationToken.None);
+        Assert.Equal(etag, savedState.ETag);
         Assert.Equal("application/test", savedState.ContentType);
         Assert.Equal("backup", savedState.Metadata["source"]);
         await using var download = await store.GetObjectAsync("bucket", "nested/backup.blk", null, CancellationToken.None);
+        Assert.Equal(etag, download.Info.ETag);
         Assert.Equal(payload, await download.Response.Content.ReadAsByteArrayAsync());
+    }
+
+    [Fact]
+    public async Task MultipartCompletion_ETagUsesOnlySelectedPartsInOrder()
+    {
+        var handler = new ListingHandler();
+        var store = CreateStore(handler, handler);
+        var firstBody = new byte[5 * 1024 * 1024];
+        var secondBody = "tail"u8.ToArray();
+        var upload = await store.CreateMultipartUploadAsync("bucket", "backup.bin", new ObjectState(), CancellationToken.None);
+        using var firstContent = new MemoryStream(firstBody);
+        using var secondContent = new MemoryStream(secondBody);
+        using var unusedContent = new MemoryStream([42]);
+        var first = await store.PutPartAsync(
+            "bucket", "backup.bin", upload.UploadId, 1, firstContent, firstBody.Length, CancellationToken.None);
+        var second = await store.PutPartAsync(
+            "bucket", "backup.bin", upload.UploadId, 2, secondContent, secondBody.Length, CancellationToken.None);
+        await store.PutPartAsync("bucket", "backup.bin", upload.UploadId, 3, unusedContent, 1, CancellationToken.None);
+
+        var completed = await store.CompleteMultipartUploadAsync(
+            "bucket", "backup.bin", upload.UploadId, [first, second], CancellationToken.None);
+
+        var etag = $"{Convert.ToHexString(MD5.HashData(
+            [.. MD5.HashData(firstBody), .. MD5.HashData(secondBody)])).ToLowerInvariant()}-2";
+        Assert.Equal(etag, completed.ETag);
+        var restarted = CreateStore(handler, handler);
+        Assert.Equal(etag, (await restarted.GetObjectInfoAsync("bucket", "backup.bin", CancellationToken.None)).ETag);
+        Assert.Equal(etag, Assert.Single(await restarted.ListObjectsAsync("bucket", CancellationToken.None)).ETag);
     }
 
     [Fact]
@@ -462,7 +662,7 @@ public sealed class GraphStoreContractTests : IDisposable
     }
 
     [Fact]
-    public async Task ListObjects_TraversesDirectPathsWithoutDownloadingPayloadsOrState()
+    public async Task ListObjects_TraversesDirectPathsWithoutDownloadingPayloads()
     {
         var handler = new ListingHandler();
         handler.AddDirectObject("bucket", "logs/2026/a.txt", new byte[3]);
@@ -477,7 +677,8 @@ public sealed class GraphStoreContractTests : IDisposable
         Assert.Equal(0, handler.ContentDownloads);
         Assert.DoesNotContain(handler.Requests, request =>
             request.Method == "GET" &&
-            request.Uri.AbsolutePath.EndsWith("/content", StringComparison.Ordinal));
+            request.Uri.AbsolutePath.EndsWith("/content", StringComparison.Ordinal) &&
+            !request.Uri.AbsolutePath.Contains(".onedrive-s3-proxy-state", StringComparison.Ordinal));
 
         handler.AddDirectObject("bucket", "added-later.txt", [1]);
         var second = await store.ListObjectsAsync("bucket", CancellationToken.None);
@@ -625,7 +826,7 @@ public sealed class GraphStoreContractTests : IDisposable
         _clients.Clear();
     }
 
-    private static async Task UploadAsync(
+    private static async Task<ObjectInfo> UploadAsync(
         OneDriveStore store,
         Stream content,
         long length,
@@ -634,14 +835,46 @@ public sealed class GraphStoreContractTests : IDisposable
     {
         if (!multipart)
         {
-            await store.PutObjectAsync("bucket", "stream.bin", content, length, cancellationToken);
-            return;
+            return await store.PutObjectAsync("bucket", "stream.bin", content, length, cancellationToken);
         }
 
         var upload = await store.CreateMultipartUploadAsync("bucket", "stream.bin", new ObjectState(), cancellationToken);
         var part = await store.PutPartAsync(
             "bucket", "stream.bin", upload.UploadId, 1, content, length, cancellationToken);
-        await store.CompleteMultipartUploadAsync("bucket", "stream.bin", upload.UploadId, [part], cancellationToken);
+        return await store.CompleteMultipartUploadAsync("bucket", "stream.bin", upload.UploadId, [part], cancellationToken);
+    }
+
+    private static async Task<HttpResponseMessage> SendS3Async(
+        HttpClient client,
+        HttpMethod method,
+        string path,
+        byte[]? body = null,
+        Dictionary<string, string>? headers = null,
+        bool sigV4 = true)
+    {
+        using var request = new HttpRequestMessage(method, path);
+        if (body is not null)
+        {
+            request.Content = new ByteArrayContent(body);
+            request.Content.Headers.ContentType = new("application/test");
+            request.Content.Headers.ContentMD5 = MD5.HashData(body);
+        }
+
+        foreach (var header in headers ?? [])
+        {
+            request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+        }
+
+        if (sigV4)
+        {
+            LonghornSigV4Signer.Sign(request, body ?? []);
+        }
+        else
+        {
+            SigV2CompatibilityTests.Sign(request);
+        }
+
+        return await client.SendAsync(request);
     }
 
     private OneDriveStore CreateStore(
@@ -1002,6 +1235,7 @@ public sealed class GraphStoreContractTests : IDisposable
         public int ContentDownloads => _contentDownloads;
         public int PageSize { get; init; } = int.MaxValue;
         public int UploadSessions { get; private set; }
+        public int StateWriteFailures { get; set; }
         public Action? BeforeUpload { get; set; }
 
         public bool HasPath(string path) => _items.ContainsKey(path);
@@ -1037,6 +1271,11 @@ public sealed class GraphStoreContractTests : IDisposable
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
+            if (request.RequestUri!.Host == "monitor.test")
+            {
+                return Json(HttpStatusCode.OK, new { status = "completed" });
+            }
+
             if (request.RequestUri!.Host == "upload.test")
             {
                 var sessionId = request.RequestUri.AbsolutePath.Trim('/');
@@ -1068,6 +1307,18 @@ public sealed class GraphStoreContractTests : IDisposable
                 {
                     rest = rest[..childIndex] + "/" + rest[(childIndex + 2)..];
                 }
+            }
+
+            if (request.Method == HttpMethod.Post && rest.EndsWith("/copy", StringComparison.Ordinal))
+            {
+                var source = _items[rest[..^"/copy".Length]];
+                using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+                var parent = body.RootElement.GetProperty("parentReference").GetProperty("id").GetString();
+                var name = body.RootElement.GetProperty("name").GetString();
+                AddFile($"{parent}/{name}", source.Content, source.Size);
+                var response = new HttpResponseMessage(HttpStatusCode.Accepted);
+                response.Headers.Location = new Uri("https://monitor.test/copy/1");
+                return response;
             }
 
             if (rest.EndsWith(":/children", StringComparison.Ordinal))
@@ -1125,6 +1376,12 @@ public sealed class GraphStoreContractTests : IDisposable
                 var path = rest[..^suffix.Length];
                 if (request.Method == HttpMethod.Put)
                 {
+                    if (path.Contains(".onedrive-s3-proxy-state", StringComparison.Ordinal) && StateWriteFailures > 0)
+                    {
+                        StateWriteFailures--;
+                        return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+                    }
+
                     BeforeUpload?.Invoke();
                     var existing = FindPath(path);
                     if (existing is not null && request.RequestUri.Query.Contains("conflictBehavior=fail", StringComparison.Ordinal))
@@ -1233,7 +1490,7 @@ public sealed class GraphStoreContractTests : IDisposable
                     id = path,
                     name,
                     size = item.Size,
-                    eTag = "\"etag\"",
+                    eTag = $"\"graph-{Convert.ToHexString(SHA256.HashData(item.Content ?? []))}\"",
                     createdDateTime = DateTimeOffset.UtcNow,
                     lastModifiedDateTime = DateTimeOffset.UtcNow,
                     folder = (object?)null

@@ -78,7 +78,7 @@ public sealed class OneDriveStore(
             throw new GraphStoreException(404, "The specified bucket does not exist.", "NoSuchBucket");
         }
 
-        var results = new Dictionary<string, ObjectInfo>(StringComparer.Ordinal);
+        var results = new Dictionary<string, DriveItem>(StringComparer.Ordinal);
         var commonPrefixes = new SortedSet<string>(StringComparer.Ordinal);
         var folders = new Queue<(string Path, string Prefix)>();
         var slash = prefix.LastIndexOf('/');
@@ -140,14 +140,25 @@ public sealed class OneDriveStore(
                     }
                     else
                     {
-                        results[key] = ToObjectInfo(key, item);
+                        results[key] = item;
                     }
                 }
             }
         }
 
+        var keys = results.Keys.OrderBy(key => key, StringComparer.Ordinal).ToArray();
+        var objects = new ObjectInfo[keys.Length];
+        await Parallel.ForAsync(0, keys.Length, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = _options.OneDrive.MaxConcurrency,
+            CancellationToken = cancellationToken
+        }, async (index, token) =>
+        {
+            objects[index] = await ToObjectInfoAsync(bucket, keys[index], results[keys[index]], token);
+        });
+
         return new ObjectListing(
-            results.Values.OrderBy(item => item.Key, StringComparer.Ordinal).ToList(),
+            objects,
             commonPrefixes.ToList());
     }
 
@@ -174,8 +185,9 @@ public sealed class OneDriveStore(
         CancellationToken cancellationToken)
     {
         await EnsureBucketAndLengthAsync(bucket, length, cancellationToken);
-        var item = await UploadObjectAsync(bucket, key, content, length!.Value, cancellationToken);
-        return ToObjectInfo(key, item);
+        using var hashingStream = new HashingReadStream(content);
+        var item = await UploadObjectAsync(bucket, key, hashingStream, length!.Value, cancellationToken);
+        return ToObjectInfo(key, item) with { ETag = hashingStream.GetHash() };
     }
 
     public async Task<GraphDownload> GetObjectAsync(
@@ -185,7 +197,7 @@ public sealed class OneDriveStore(
         CancellationToken cancellationToken)
     {
         var (_, item) = await ResolveObjectAsync(bucket, key, cancellationToken);
-        var info = ToObjectInfo(key, item);
+        var info = await ToObjectInfoAsync(bucket, key, item, cancellationToken);
         var request = await CreateRequestAsync(
             HttpMethod.Get,
             $"{ItemIdPath(item.Id)}/content",
@@ -208,7 +220,7 @@ public sealed class OneDriveStore(
     public async Task<ObjectInfo> GetObjectInfoAsync(string bucket, string key, CancellationToken cancellationToken)
     {
         var (_, item) = await ResolveObjectAsync(bucket, key, cancellationToken);
-        return ToObjectInfo(key, item);
+        return await ToObjectInfoAsync(bucket, key, item, cancellationToken);
     }
 
     public async Task DeleteObjectAsync(string bucket, string key, CancellationToken cancellationToken)
@@ -229,6 +241,7 @@ public sealed class OneDriveStore(
         CancellationToken cancellationToken)
     {
         var (_, sourceItem) = await ResolveObjectAsync(sourceBucket, sourceKey, cancellationToken);
+        var sourceInfo = await ToObjectInfoAsync(sourceBucket, sourceKey, sourceItem, cancellationToken);
         if (!await BucketExistsAsync(destinationBucket, cancellationToken))
         {
             throw new GraphStoreException(404, "The destination bucket does not exist.", "NoSuchBucket");
@@ -258,9 +271,7 @@ public sealed class OneDriveStore(
         {
             throw new GraphStoreException(502, "Microsoft Graph returned a copy destination with an unexpected name or type.");
         }
-
-
-        return ToObjectInfo(destinationKey, copied);
+        return ToObjectInfo(destinationKey, copied) with { ETag = sourceInfo.ETag };
     }
 
     private async Task MonitorCopyAsync(Uri monitorUrl, CancellationToken cancellationToken)
@@ -327,8 +338,7 @@ public sealed class OneDriveStore(
         var bytes = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
         var path = ObjectStatePath(bucket, key);
 
-        // Objects are only listed once their state exists, so retry transient failures
-        // instead of leaving an uploaded object invisible to listings.
+        // Do not acknowledge successful writes without their persistent S3 metadata.
         for (var attempt = 1; ; attempt++)
         {
             try
@@ -496,10 +506,21 @@ public sealed class OneDriveStore(
                     $"Stored state for part {part.PartNumber} has no data reference."))).ToList(),
             OpenPathDownloadAsync);
         var item = await UploadObjectAsync(bucket, key, combined, totalLength, cancellationToken);
-        await PutObjectStateAsync(bucket, key, upload.State, cancellationToken);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+        foreach (var part in selected)
+        {
+            hash.AppendData(Convert.FromHexString(NormalizeEtag(part.ETag)));
+        }
+
+        var etag = $"{Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant()}-{selected.Count}";
+        await PutObjectStateAsync(bucket, key, upload.State with
+        {
+            ETag = etag,
+            StorageETag = item.ETag
+        }, cancellationToken);
 
         await DeletePathAsync(MultipartUploadPath(bucket, uploadId), ignoreMissing: true, cancellationToken);
-        return ToObjectInfo(key, item);
+        return ToObjectInfo(key, item) with { ETag = etag };
     }
 
     public async Task AbortMultipartUploadAsync(
@@ -1107,8 +1128,22 @@ public sealed class OneDriveStore(
 
     private static string NormalizeEtag(string etag) => etag.Trim().Trim('"');
 
+    private async Task<ObjectInfo> ToObjectInfoAsync(
+        string bucket,
+        string key,
+        DriveItem item,
+        CancellationToken cancellationToken)
+    {
+        var state = await GetObjectStateAsync(bucket, key, cancellationToken);
+        var info = ToObjectInfo(key, item);
+        // A direct OneDrive edit invalidates the checksum associated with the previous version.
+        return state.ETag is not null && state.StorageETag == item.ETag
+            ? info with { ETag = state.ETag }
+            : info;
+    }
+
     private static ObjectInfo ToObjectInfo(string key, DriveItem item) =>
-        new(key, item.Size, item.LastModifiedDateTime, item.ETag);
+        new(key, item.Size, item.LastModifiedDateTime, item.ETag) { StorageETag = item.ETag };
 
     private static async Task<int> ReadExactlyUpToAsync(
         Stream stream,

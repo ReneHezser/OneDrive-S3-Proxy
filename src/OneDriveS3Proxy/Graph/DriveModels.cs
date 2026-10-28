@@ -5,7 +5,10 @@ namespace OneDriveS3Proxy.Graph;
 
 public sealed record BucketInfo(string Name, DateTimeOffset Created);
 
-public sealed record ObjectInfo(string Key, long Size, DateTimeOffset LastModified, string ETag);
+public sealed record ObjectInfo(string Key, long Size, DateTimeOffset LastModified, string ETag)
+{
+    public string? StorageETag { get; init; }
+}
 
 public sealed record ObjectListing(IReadOnlyList<ObjectInfo> Objects, IReadOnlyList<string> CommonPrefixes)
 {
@@ -35,6 +38,8 @@ public sealed record ObjectListing(IReadOnlyList<ObjectInfo> Objects, IReadOnlyL
 public sealed record ObjectState
 {
     public string? Key { get; init; }
+    public string? ETag { get; init; }
+    public string? StorageETag { get; init; }
     public string ContentType { get; init; } = "application/octet-stream";
     public Dictionary<string, string> Headers { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, string> Metadata { get; init; } = new(StringComparer.OrdinalIgnoreCase);

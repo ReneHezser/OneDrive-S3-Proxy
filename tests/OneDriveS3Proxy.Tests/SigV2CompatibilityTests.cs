@@ -200,7 +200,7 @@ public sealed class SigV2CompatibilityTests(LonghornProxyFactory factory) : ICla
         return await _client.SendAsync(request);
     }
 
-    private static void Sign(HttpRequestMessage request, string? canonicalResource = null, DateTimeOffset? signedAt = null)
+    internal static void Sign(HttpRequestMessage request, string? canonicalResource = null, DateTimeOffset? signedAt = null)
     {
         var date = (signedAt ?? DateTimeOffset.UtcNow).ToString("r", CultureInfo.InvariantCulture);
         request.Headers.TryAddWithoutValidation("Date", date);
