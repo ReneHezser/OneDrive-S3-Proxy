@@ -12,6 +12,8 @@ public interface IOneDriveStore
     /// <remarks>
     /// The caller retains ownership of the stream and must keep it open until the task completes.
     /// The stream remains open after success, failure, or cancellation; its position may advance in all cases.
+    /// The returned ETag is the content MD5. The caller must persist it and StorageETag with
+    /// the request metadata using PutObjectStateAsync before acknowledging the upload.
     /// </remarks>
     Task<ObjectInfo> PutObjectAsync(string bucket, string key, Stream content, long? length, CancellationToken cancellationToken);
 

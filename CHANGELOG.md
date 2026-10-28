@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7] - 2026-10-28
+
+### Fixed
+
+- Return content-MD5 ETags for single-object uploads and persist them across reads,
+  listings, and copies instead of exposing OneDrive version tags to clients such
+  as QNAP. Multipart completion now persists the standard MD5-of-part-MD5s ETag.
+
 ## [0.1.6] - 2026-10-28
 
 ### Added

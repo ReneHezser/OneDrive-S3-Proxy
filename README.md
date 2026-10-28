@@ -29,6 +29,19 @@ Uploads require `Content-Length`.
 The default 238,000 MiB limit stays below OneDrive's 250 GB file limit and can be
 reduced with configuration.
 
+Single-object uploads return a quoted, lowercase content-MD5 ETag, including when
+Graph upload sessions are used. Multipart ETags use the MD5 of the concatenated
+binary part MD5s followed by `-<part-count>`. ETags are persisted with object
+metadata and reused by GET, HEAD, listings, and copies; metadata/tag updates do not
+change them. Listings read the small metadata sidecars with bounded concurrency,
+not the object payloads.
+
+Objects uploaded before this fix, files added directly in OneDrive, and payloads
+edited outside the proxy retain OneDrive's opaque version tags until re-uploaded
+through the proxy. The proxy does not download or rewrite existing backups to
+backfill checksums. A stored checksum is used only while its OneDrive version tag
+still matches the payload.
+
 SigV4 requests must sign the `host` header and every `x-amz-*` header they send (other than
 `x-amz-date` and `x-amz-content-sha256`, which are bound by the signature itself).
 SigV4 header-signed requests must be within 15 minutes of the server clock; presigned URLs

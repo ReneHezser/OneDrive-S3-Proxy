@@ -326,14 +326,22 @@ public static partial class S3Endpoints
                     bucket,
                     key,
                     cancellationToken);
-            await store.PutObjectStateAsync(bucket, key, state, cancellationToken);
+            await store.PutObjectStateAsync(bucket, key, state with
+            {
+                ETag = copied.ETag,
+                StorageETag = copied.StorageETag
+            }, cancellationToken);
             return Xml(new XElement(S3Namespace + "CopyObjectResult",
                 new XElement(S3Namespace + "LastModified", S3Date(copied.LastModified)),
                 new XElement(S3Namespace + "ETag", QuoteEtag(copied.ETag))));
         }
 
         var item = await store.PutObjectAsync(bucket, key, request.Body, request.ContentLength, cancellationToken);
-        await store.PutObjectStateAsync(bucket, key, CaptureObjectState(request), cancellationToken);
+        await store.PutObjectStateAsync(bucket, key, CaptureObjectState(request) with
+        {
+            ETag = item.ETag,
+            StorageETag = item.StorageETag
+        }, cancellationToken);
         response.Headers.ETag = QuoteEtag(item.ETag);
         return Results.Ok();
     }
