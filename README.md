@@ -9,6 +9,59 @@ file-name, path-length, and case-insensitive naming restrictions. The service us
 and the OAuth 2.0 client-credentials flow. `Azure.Identity` caches and refreshes the
 Graph access token for the process lifetime.
 
+## Infrastructure
+
+The diagram shows the Kubernetes deployment with its default ports and replica
+count. Add a TLS-terminating ingress separately for external access; in-cluster
+clients can use the ClusterIP Service directly.
+
+```mermaid
+flowchart LR
+    external["External S3 clients<br/>AWS CLI / SDKs"]
+
+    subgraph cluster["Kubernetes cluster"]
+        ingress["Optional ingress<br/>TLS termination"]
+        internal["In-cluster S3 clients<br/>e.g. Longhorn or s3manager"]
+        service["ClusterIP Service<br/>onedrive-s3-proxy:80"]
+        proxy["Deployment: onedrive-s3-proxy<br/>2 ASP.NET Core proxy replicas<br/>HTTP :9000 / S3 SigV2 and SigV4"]
+        config["ConfigMap<br/>Entra, OneDrive and S3 settings"]
+        secrets["Secret<br/>Entra client secret and S3 keys"]
+
+        ingress -->|HTTP| service
+        internal -->|Path-style S3 over HTTP| service
+        service -->|Target port 9000| proxy
+        config -.->|Environment variables| proxy
+        secrets -.->|Environment variables| proxy
+    end
+
+    subgraph microsoft["Microsoft cloud"]
+        entra["Microsoft Entra ID<br/>Application authentication"]
+        graphApi["Microsoft Graph"]
+
+        subgraph onedrive["OneDrive for Business - configured user"]
+            root["Root folder<br/>Default: S3"]
+            objects["Bucket folders<br/>Object payloads at original S3 key paths"]
+            state[".onedrive-s3-proxy-state<br/>Metadata, tags and multipart upload state"]
+
+            root --> objects
+            root --> state
+        end
+    end
+
+    external -->|Path-style S3 over HTTPS| ingress
+    proxy <-->|HTTPS - OAuth 2.0 client credentials| entra
+    proxy <-->|HTTPS - Graph API with access token| graphApi
+    graphApi <--> root
+```
+
+S3 clients use the proxy's access and secret keys, not Entra credentials. The proxy
+obtains its own Graph token using the Entra application credentials. Persistent
+object data and upload state live in OneDrive; the deployment requires no
+PersistentVolumeClaim or separate database.
+
+For a local Docker deployment, clients connect to the published proxy port instead
+of the Kubernetes Service; the Microsoft cloud dependencies remain the same.
+
 ## Supported API
 
 - AWS Signature Versions 2 and 4 header and presigned URL authentication
