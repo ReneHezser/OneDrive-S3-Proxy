@@ -25,7 +25,9 @@ ACLs, bucket policies, versioning, server-side encryption, lifecycle rules, Uplo
 and virtual-hosted bucket URLs are not supported. Requests for any unsupported
 sub-resource (for example `?acl`, `?versionId`, `?policy`, or `?versioning`) are rejected
 with `501 NotImplemented` instead of running as a plain bucket or object operation.
-Uploads require `Content-Length`.
+Versioned `x-amz-copy-source` values are also rejected with `501 NotImplemented`.
+Uploads require `Content-Length`; tags are validated before storing the payload.
+Multi-object delete requests reject missing or invalid keys before deleting any objects.
 The default 238,000 MiB limit stays below OneDrive's 250 GB file limit and can be
 reduced with configuration.
 
