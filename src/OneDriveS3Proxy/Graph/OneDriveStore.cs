@@ -225,12 +225,18 @@ public sealed class OneDriveStore(
 
     public async Task DeleteObjectAsync(string bucket, string key, CancellationToken cancellationToken)
     {
+        string? deletedPath = null;
         if (await TryResolveKeyPathAsync(bucket, key, cancellationToken) is { } direct && direct.Item.Folder is null)
         {
             await DeletePathAsync(direct.Path, ignoreMissing: true, cancellationToken, ItemIdPath(direct.Item.Id));
+            deletedPath = direct.Path;
         }
 
         await DeleteObjectStateAsync(bucket, key, cancellationToken);
+        if (deletedPath is not null)
+        {
+            await PruneEmptyParentFoldersAsync(deletedPath, BucketPath(bucket), cancellationToken);
+        }
     }
 
     public async Task<ObjectInfo> CopyObjectAsync(
@@ -357,8 +363,12 @@ public sealed class OneDriveStore(
     private static bool IsTransient(GraphStoreException exception) =>
         exception.StatusCode >= 500;
 
-    public Task DeleteObjectStateAsync(string bucket, string key, CancellationToken cancellationToken) =>
-        DeletePathAsync(ObjectStatePath(bucket, key), ignoreMissing: true, cancellationToken);
+    public async Task DeleteObjectStateAsync(string bucket, string key, CancellationToken cancellationToken)
+    {
+        var path = ObjectStatePath(bucket, key);
+        await DeletePathAsync(path, ignoreMissing: true, cancellationToken);
+        await PruneEmptyParentFoldersAsync(path, StatePath("objects"), cancellationToken);
+    }
 
     public async Task<MultipartUpload> CreateMultipartUploadAsync(
         string bucket,
@@ -990,6 +1000,76 @@ public sealed class OneDriveStore(
         }
 
         await EnsureSuccessAsync(response, cancellationToken);
+    }
+
+    private async Task PruneEmptyParentFoldersAsync(
+        string deletedPath,
+        string boundaryPath,
+        CancellationToken cancellationToken)
+    {
+        var boundaryPrefix = boundaryPath + "/";
+        for (var path = deletedPath[..deletedPath.LastIndexOf('/')];
+             path.StartsWith(boundaryPrefix, StringComparison.Ordinal);
+             path = path[..path.LastIndexOf('/')])
+        {
+            var folder = await TryGetItemAsync(path, cancellationToken);
+            if (folder is null)
+            {
+                continue;
+            }
+
+            if (folder.Folder is null ||
+                !folder.Name.Equals(path[(path.LastIndexOf('/') + 1)..], StringComparison.Ordinal) ||
+                !await TryDeleteEmptyFolderAsync(folder, cancellationToken))
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task<bool> TryDeleteEmptyFolderAsync(DriveItem folder, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(folder.Id) ||
+            !EntityTagHeaderValue.TryParse(folder.ETag, out var etag) || etag.Tag == "*")
+        {
+            throw new GraphStoreException(502, "Microsoft Graph returned a folder without a valid ID or entity tag.");
+        }
+
+        string? next = $"{ItemIdPath(folder.Id)}/children?$select=id&$top=1";
+        while (next is not null)
+        {
+            using var childrenResponse = await SendAsync(HttpMethod.Get, next, null, cancellationToken);
+            if (childrenResponse.StatusCode == HttpStatusCode.NotFound)
+            {
+                return true;
+            }
+
+            await EnsureSuccessAsync(childrenResponse, cancellationToken);
+            var page = await childrenResponse.Content.ReadFromJsonAsync<DriveItemCollection>(cancellationToken)
+                ?? throw new GraphStoreException(502, "Microsoft Graph returned an empty collection response.");
+            if (page.Value.Count != 0)
+            {
+                return false;
+            }
+
+            next = page.NextLink;
+        }
+
+        // Folder ETags do not cover child additions; writers must not target this subtree during cleanup.
+        using var request = await CreateRequestAsync(HttpMethod.Delete, ItemIdPath(folder.Id), null, cancellationToken);
+        request.Headers.IfMatch.Add(etag);
+        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (response.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.PreconditionFailed)
+        {
+            return false;
+        }
+
+        if (response.StatusCode != HttpStatusCode.NotFound)
+        {
+            await EnsureSuccessAsync(response, cancellationToken);
+        }
+
+        return true;
     }
 
     private async Task PutJsonAsync<T>(string path, T value, CancellationToken cancellationToken)

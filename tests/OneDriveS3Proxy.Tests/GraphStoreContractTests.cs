@@ -462,6 +462,308 @@ public sealed class GraphStoreContractTests : IDisposable
     }
 
     [Theory]
+    [InlineData("file.txt")]
+    [InlineData("backups/file.txt")]
+    [InlineData("backups/daily/nested/file.txt")]
+    [InlineData("backups # %25/daily/file.txt")]
+    public async Task DeleteObject_PrunesEmptyAncestorsWithoutRemovingBucket(string key)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", key, [1]);
+        handler.AddDirectObject("other-bucket", "keep.txt", [2]);
+        var store = CreateStore(handler, handler);
+
+        await store.DeleteObjectAsync("bucket", key, CancellationToken.None);
+
+        var segments = key.Split('/');
+        for (var length = 1; length <= segments.Length; length++)
+        {
+            Assert.False(handler.HasPath($"S3/bucket/{string.Join('/', segments[..length])}"));
+        }
+
+        Assert.True(handler.HasPath("S3/bucket"));
+        Assert.True(handler.HasPath("S3"));
+        Assert.True(handler.HasPath("S3/other-bucket/keep.txt"));
+        Assert.Equal(segments.Length - 1, handler.Requests.Count(request =>
+            request.Method == "DELETE" && request.IfMatch == "\"folder\""));
+    }
+
+    [Theory]
+    [InlineData("backups/other.txt", false)]
+    [InlineData("backups/other/keep.txt", false)]
+    [InlineData("backups/empty", true)]
+    public async Task DeleteObject_StopsAtParentWithRemainingChildren(string sibling, bool folder)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backups/deep/file.txt", [1]);
+        if (folder)
+        {
+            handler.AddEmptyFolder("bucket", sibling);
+        }
+        else
+        {
+            handler.AddDirectObject("bucket", sibling, [2]);
+        }
+        var store = CreateStore(handler, handler);
+
+        await store.DeleteObjectAsync("bucket", "backups/deep/file.txt", CancellationToken.None);
+
+        Assert.False(handler.HasPath("S3/bucket/backups/deep"));
+        Assert.True(handler.HasPath("S3/bucket/backups"));
+        Assert.True(handler.HasPath($"S3/bucket/{sibling}"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeleteObject_PrunesMetadataWithoutRemovingSharedStateOrActiveUploads(bool sameShard)
+    {
+        const string key = "backups/file.txt";
+        const string stateRoot = "S3/.onedrive-s3-proxy-state";
+        var shard = OneDrivePathMapper.Hash(key)[..2];
+        var otherKey = Enumerable.Range(0, 10000)
+            .Select(index => $"other-{index}.txt")
+            .First(candidate => OneDrivePathMapper.Hash(candidate).StartsWith(shard, StringComparison.Ordinal) == sameShard);
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", key, [1]);
+        var store = CreateStore(handler, handler);
+        await store.PutObjectStateAsync("bucket", key, new ObjectState(), CancellationToken.None);
+        await store.PutObjectStateAsync("bucket", otherKey, new ObjectState { ContentType = "text/plain" }, CancellationToken.None);
+        var upload = await store.CreateMultipartUploadAsync("bucket", "pending/file.bin", new ObjectState(), CancellationToken.None);
+        var manifestPath = $"{stateRoot}/multipart/bucket/{upload.UploadId}/manifest.json";
+
+        await store.DeleteObjectAsync("bucket", key, CancellationToken.None);
+
+        Assert.False(handler.HasPath($"{stateRoot}/objects/bucket/{shard}/{OneDrivePathMapper.Hash(key)}.json"));
+        Assert.Equal(sameShard, handler.HasPath($"{stateRoot}/objects/bucket/{shard}"));
+        Assert.Equal("text/plain", (await store.GetObjectStateAsync("bucket", otherKey, CancellationToken.None)).ContentType);
+        Assert.True(handler.HasPath(manifestPath));
+
+        await store.DeleteObjectStateAsync("bucket", otherKey, CancellationToken.None);
+
+        Assert.False(handler.HasPath($"{stateRoot}/objects/bucket"));
+        Assert.True(handler.HasPath($"{stateRoot}/objects"));
+        Assert.True(handler.HasPath(stateRoot));
+        Assert.True(handler.HasPath(manifestPath));
+        Assert.True(handler.HasPath("S3/bucket"));
+    }
+
+    [Theory]
+    [InlineData("backups/missing.txt")]
+    [InlineData("BACKUPS/file.txt")]
+    [InlineData("backups")]
+    public async Task DeleteObject_DoesNotPrunePayloadFoldersForMissingOrFolderKeys(string key)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backups/file.txt", [1]);
+        var store = CreateStore(handler, handler);
+
+        await store.DeleteObjectAsync("bucket", key, CancellationToken.None);
+
+        Assert.True(handler.HasPath("S3/bucket/backups/file.txt"));
+        Assert.DoesNotContain(handler.Requests, request => request.Method == "DELETE" && request.IfMatch is not null);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Conflict)]
+    [InlineData(HttpStatusCode.PreconditionFailed)]
+    public async Task DeleteObject_LeavesFoldersOnCleanupConflict(HttpStatusCode status)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backups/deep/file.txt", [1]);
+        handler.OverrideResponse = request =>
+            request.Method == HttpMethod.Delete &&
+            Uri.UnescapeDataString(request.RequestUri!.AbsolutePath).EndsWith("/drive/items/S3/bucket/backups/deep", StringComparison.Ordinal)
+                ? new HttpResponseMessage(status)
+                : null;
+        var store = CreateStore(handler, handler);
+
+        await store.DeleteObjectAsync("bucket", "backups/deep/file.txt", CancellationToken.None);
+
+        Assert.False(handler.HasPath("S3/bucket/backups/deep/file.txt"));
+        Assert.True(handler.HasPath("S3/bucket/backups/deep"));
+        Assert.True(handler.HasPath("S3/bucket/backups"));
+        Assert.Single(handler.Requests, request => request.Method == "DELETE" && request.IfMatch == "\"folder\"");
+    }
+
+    [Theory]
+    [InlineData("lookup")]
+    [InlineData("children")]
+    [InlineData("delete")]
+    public async Task DeleteObject_ContinuesWhenAnEmptyParentDisappears(string phase)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backups/deep/file.txt", [1]);
+        handler.OverrideResponse = request =>
+        {
+            if (handler.HasPath("S3/bucket/backups/deep/file.txt"))
+            {
+                return null;
+            }
+
+            var path = Uri.UnescapeDataString(request.RequestUri!.AbsolutePath);
+            var matches = phase switch
+            {
+                "lookup" => request.Method == HttpMethod.Get && path.EndsWith("/drive/root:/S3/bucket/backups/deep", StringComparison.Ordinal),
+                "children" => request.Method == HttpMethod.Get && path.EndsWith("/drive/items/S3/bucket/backups/deep/children", StringComparison.Ordinal),
+                _ => request.Method == HttpMethod.Delete && path.EndsWith("/drive/items/S3/bucket/backups/deep", StringComparison.Ordinal)
+            };
+            if (!matches)
+            {
+                return null;
+            }
+
+            handler.RemovePath("S3/bucket/backups/deep");
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        };
+        var store = CreateStore(handler, handler);
+
+        await store.DeleteObjectAsync("bucket", "backups/deep/file.txt", CancellationToken.None);
+
+        Assert.False(handler.HasPath("S3/bucket/backups"));
+        Assert.True(handler.HasPath("S3/bucket"));
+    }
+
+    [Theory]
+    [InlineData(false, HttpStatusCode.Forbidden)]
+    [InlineData(true, HttpStatusCode.InternalServerError)]
+    public async Task DeleteObject_PropagatesUnexpectedCleanupErrors(bool delete, HttpStatusCode status)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backups/file.txt", [1]);
+        handler.OverrideResponse = request =>
+            request.Method == (delete ? HttpMethod.Delete : HttpMethod.Get) &&
+            Uri.UnescapeDataString(request.RequestUri!.AbsolutePath).EndsWith(
+                "/drive/items/S3/bucket/backups" + (delete ? string.Empty : "/children"), StringComparison.Ordinal)
+                ? new HttpResponseMessage(status)
+                : null;
+        var store = CreateStore(handler, handler);
+
+        var exception = await Assert.ThrowsAsync<GraphStoreException>(() =>
+            store.DeleteObjectAsync("bucket", "backups/file.txt", CancellationToken.None));
+
+        Assert.Equal((int)status, exception.StatusCode);
+        Assert.False(handler.HasPath("S3/bucket/backups/file.txt"));
+        Assert.True(handler.HasPath("S3/bucket/backups"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeleteObject_ChecksChildrenInsteadOfTrustingChildCount(bool newChild)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backups/file.txt", [1]);
+        handler.OverrideResponse = request =>
+        {
+            if (request.Method != HttpMethod.Get)
+            {
+                return null;
+            }
+
+            var path = Uri.UnescapeDataString(request.RequestUri!.AbsolutePath);
+            if (path.EndsWith("/drive/root:/S3/bucket/backups", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(new
+                    {
+                        id = "S3/bucket/backups",
+                        name = "backups",
+                        eTag = "\"folder\"",
+                        folder = new { childCount = newChild ? 0 : 1 }
+                    })
+                };
+            }
+
+            if (newChild && path.EndsWith("/drive/items/S3/bucket/backups/children", StringComparison.Ordinal))
+            {
+                handler.AddDirectObject("bucket", "backups/new.txt", [2]);
+            }
+
+            return null;
+        };
+        var store = CreateStore(handler, handler);
+
+        await store.DeleteObjectAsync("bucket", "backups/file.txt", CancellationToken.None);
+
+        Assert.Equal(newChild, handler.HasPath("S3/bucket/backups"));
+        Assert.Equal(newChild, handler.HasPath("S3/bucket/backups/new.txt"));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("*")]
+    [InlineData("invalid")]
+    public async Task DeleteObject_RequiresAValidFolderEntityTagForCleanup(string etag)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backups/file.txt", [1]);
+        handler.OverrideResponse = request =>
+            request.Method == HttpMethod.Get &&
+            Uri.UnescapeDataString(request.RequestUri!.AbsolutePath).EndsWith("/drive/root:/S3/bucket/backups", StringComparison.Ordinal)
+                ? new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(new
+                    {
+                        id = "S3/bucket/backups",
+                        name = "backups",
+                        eTag = etag,
+                        folder = new { childCount = 0 }
+                    })
+                }
+                : null;
+        var store = CreateStore(handler, handler);
+
+        var exception = await Assert.ThrowsAsync<GraphStoreException>(() =>
+            store.DeleteObjectAsync("bucket", "backups/file.txt", CancellationToken.None));
+
+        Assert.Equal(502, exception.StatusCode);
+        Assert.True(handler.HasPath("S3/bucket/backups"));
+        Assert.DoesNotContain(handler.Requests, request => request.Method == "DELETE" && request.IfMatch is not null);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task S3Deletes_PruneEmptyPayloadAndMetadataFolders(bool bulk)
+    {
+        var handler = new ListingHandler();
+        var store = CreateStore(handler, handler);
+        foreach (var key in new[] { "backups/first.txt", "backups/second.txt" })
+        {
+            handler.AddDirectObject("bucket", key, [1]);
+            await store.PutObjectStateAsync("bucket", key, new ObjectState(), CancellationToken.None);
+        }
+        await using var factory = new LonghornProxyFactory();
+        await using var proxy = factory.WithWebHostBuilder(builder => builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IOneDriveStore>();
+            services.AddSingleton<IOneDriveStore>(store);
+        }));
+        using var client = proxy.CreateClient();
+
+        using var first = await SendS3Async(client, HttpMethod.Delete, "/bucket/backups/first.txt");
+        Assert.Equal(HttpStatusCode.NoContent, first.StatusCode);
+        Assert.True(handler.HasPath("S3/bucket/backups"));
+
+        using var last = bulk
+            ? await SendS3Async(client, HttpMethod.Post, "/bucket?delete",
+                "<Delete><Object><Key>backups/first.txt</Key></Object><Object><Key>backups/second.txt</Key></Object></Delete>"u8.ToArray())
+            : await SendS3Async(client, HttpMethod.Delete, "/bucket/backups/second.txt");
+        Assert.Equal(bulk ? HttpStatusCode.OK : HttpStatusCode.NoContent, last.StatusCode);
+        Assert.False(handler.HasPath("S3/bucket/backups"));
+        Assert.False(handler.HasPath("S3/.onedrive-s3-proxy-state/objects/bucket"));
+        Assert.True(handler.HasPath("S3/bucket"));
+        Assert.True(handler.HasPath("S3/.onedrive-s3-proxy-state"));
+
+        using var list = await SendS3Async(client, HttpMethod.Get, "/bucket?prefix=backups%2F&delimiter=%2F");
+        Assert.Equal(HttpStatusCode.OK, list.StatusCode);
+        Assert.DoesNotContain(XDocument.Parse(await list.Content.ReadAsStringAsync()).Descendants(),
+            element => element.Name.LocalName is "Contents" or "CommonPrefixes");
+    }
+
+    [Theory]
     [InlineData(4 * 1024 * 1024 + 1, false)]
     [InlineData(5 * 1024 * 1024, false)]
     [InlineData(10 * 1024 * 1024 + 37, false)]
@@ -1037,7 +1339,8 @@ public sealed class GraphStoreContractTests : IDisposable
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
-            Requests.Add(new RequestRecord(request.Method.Method, request.RequestUri!));
+            Requests.Add(new RequestRecord(request.Method.Method, request.RequestUri!,
+                request.Headers.IfMatch.Count == 0 ? null : request.Headers.IfMatch.ToString()));
             return await RespondAsync(request, cancellationToken);
         }
 
@@ -1237,8 +1540,17 @@ public sealed class GraphStoreContractTests : IDisposable
         public int UploadSessions { get; private set; }
         public int StateWriteFailures { get; set; }
         public Action? BeforeUpload { get; set; }
+        public Func<HttpRequestMessage, HttpResponseMessage?>? OverrideResponse { get; set; }
 
         public bool HasPath(string path) => _items.ContainsKey(path);
+
+        public void RemovePath(string path)
+        {
+            foreach (var candidate in _items.Keys.Where(candidate => candidate == path || candidate.StartsWith(path + "/", StringComparison.Ordinal)))
+            {
+                _items.TryRemove(candidate, out _);
+            }
+        }
 
         public void AddDirectObject(string bucket, string key, byte[] content) =>
             AddFile($"S3/{bucket}/{key}", content, content.Length);
@@ -1271,6 +1583,11 @@ public sealed class GraphStoreContractTests : IDisposable
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
+            if (OverrideResponse?.Invoke(request) is { } overridden)
+            {
+                return overridden;
+            }
+
             if (request.RequestUri!.Host == "monitor.test")
             {
                 return Json(HttpStatusCode.OK, new { status = "completed" });
@@ -1321,9 +1638,11 @@ public sealed class GraphStoreContractTests : IDisposable
                 return response;
             }
 
-            if (rest.EndsWith(":/children", StringComparison.Ordinal))
+            if (rest.EndsWith(":/children", StringComparison.Ordinal) ||
+                byId && rest.EndsWith("/children", StringComparison.Ordinal))
             {
-                var parent = rest[..^":/children".Length];
+                var suffix = rest.EndsWith(":/children", StringComparison.Ordinal) ? ":/children" : "/children";
+                var parent = rest[..^suffix.Length];
                 if (request.Method == HttpMethod.Post)
                 {
                     using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
@@ -1416,11 +1735,13 @@ public sealed class GraphStoreContractTests : IDisposable
                     return new HttpResponseMessage(HttpStatusCode.NotFound);
                 }
 
-                foreach (var path in _items.Keys.Where(path => path == actual || path.StartsWith(actual + "/", StringComparison.Ordinal)))
+                if (_items[actual].IsFolder && request.Headers.IfMatch.Count > 0 &&
+                    request.Headers.IfMatch.ToString() != "\"folder\"")
                 {
-                    _items.TryRemove(path, out _);
+                    return new HttpResponseMessage(HttpStatusCode.PreconditionFailed);
                 }
 
+                RemovePath(actual);
                 return new HttpResponseMessage(HttpStatusCode.NoContent);
             }
 
@@ -1471,7 +1792,7 @@ public sealed class GraphStoreContractTests : IDisposable
             return Json(HttpStatusCode.OK, page);
         }
 
-        private static object Describe(string path, (bool IsFolder, byte[]? Content, long Size) item)
+        private object Describe(string path, (bool IsFolder, byte[]? Content, long Size) item)
         {
             var name = path[(path.LastIndexOf('/') + 1)..];
             return item.IsFolder
@@ -1483,7 +1804,12 @@ public sealed class GraphStoreContractTests : IDisposable
                     eTag = "\"folder\"",
                     createdDateTime = DateTimeOffset.UtcNow,
                     lastModifiedDateTime = DateTimeOffset.UtcNow,
-                    folder = (object?)new { childCount = 0 }
+                    folder = (object?)new
+                    {
+                        childCount = _items.Keys.Count(candidate =>
+                            candidate.StartsWith(path + "/", StringComparison.Ordinal) &&
+                            !candidate[(path.Length + 1)..].Contains('/'))
+                    }
                 }
                 : new
                 {
@@ -1498,5 +1824,5 @@ public sealed class GraphStoreContractTests : IDisposable
         }
     }
 
-    private sealed record RequestRecord(string Method, Uri Uri);
+    private sealed record RequestRecord(string Method, Uri Uri, string? IfMatch);
 }
