@@ -229,8 +229,16 @@ public static partial class S3Endpoints
         var keys = document
             .Descendants()
             .Where(element => element.Name.LocalName == "Object")
-            .Select(element => element.Elements().FirstOrDefault(child => child.Name.LocalName == "Key")?.Value
-                ?? throw new S3Exception(400, "MalformedXML", "Each object must include a key."))
+            .Select(element =>
+            {
+                if (element.Elements().Any(child => child.Name.LocalName == "VersionId"))
+                {
+                    throw new S3Exception(501, "NotImplemented", "Versioned deletes are not supported.");
+                }
+
+                return element.Elements().FirstOrDefault(child => child.Name.LocalName == "Key")?.Value
+                    ?? throw new S3Exception(400, "MalformedXML", "Each object must include a key.");
+            })
             .ToList();
         if (keys.Count is 0 or > 1000)
         {
