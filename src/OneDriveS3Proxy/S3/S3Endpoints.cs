@@ -229,13 +229,17 @@ public static partial class S3Endpoints
         var keys = document
             .Descendants()
             .Where(element => element.Name.LocalName == "Object")
-            .Select(element => element.Elements().FirstOrDefault(child => child.Name.LocalName == "Key")?.Value)
-            .Where(key => key is not null)
-            .Cast<string>()
+            .Select(element => element.Elements().FirstOrDefault(child => child.Name.LocalName == "Key")?.Value
+                ?? throw new S3Exception(400, "MalformedXML", "Each object must include a key."))
             .ToList();
         if (keys.Count is 0 or > 1000)
         {
             throw new S3Exception(400, "MalformedXML", "Delete requests must contain between 1 and 1000 object keys.");
+        }
+
+        foreach (var key in keys)
+        {
+            ValidateKey(key);
         }
 
         var quiet = string.Equals(
@@ -244,7 +248,6 @@ public static partial class S3Endpoints
             StringComparison.OrdinalIgnoreCase);
         foreach (var key in keys)
         {
-            ValidateKey(key);
             await store.DeleteObjectAsync(bucket, key, cancellationToken);
         }
 
@@ -336,8 +339,9 @@ public static partial class S3Endpoints
                 new XElement(S3Namespace + "ETag", QuoteEtag(copied.ETag))));
         }
 
+        var objectState = CaptureObjectState(request);
         var item = await store.PutObjectAsync(bucket, key, request.Body, request.ContentLength, cancellationToken);
-        await store.PutObjectStateAsync(bucket, key, CaptureObjectState(request) with
+        await store.PutObjectStateAsync(bucket, key, objectState with
         {
             ETag = item.ETag,
             StorageETag = item.StorageETag
@@ -634,6 +638,11 @@ public static partial class S3Endpoints
         var queryIndex = decoded.IndexOf('?');
         if (queryIndex >= 0)
         {
+            if (QueryHelpers.ParseQuery(decoded[queryIndex..]).ContainsKey("versionId"))
+            {
+                throw new S3Exception(501, "NotImplemented", "Versioned copy sources are not supported.");
+            }
+
             decoded = decoded[..queryIndex];
         }
 

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.9] - 2026-10-29
+
+### Fixed
+
+- Validate upload metadata and tags before writing object payloads, so invalid tags
+  cannot overwrite an existing object or create a new one.
+- Reject versioned copy sources with `501 NotImplemented` instead of copying the
+  current version.
+- Validate all multi-object delete keys before deleting objects, including rejecting
+  object entries without a key.
+
 ## [0.1.8] - 2026-10-29
 
 ### Fixed
