@@ -1002,16 +1002,27 @@ public sealed class OneDriveStore(
         await EnsureSuccessAsync(response, cancellationToken);
     }
 
-    private async Task PruneEmptyParentFoldersAsync(
+    internal async Task PruneEmptyParentFoldersAsync(
         string deletedPath,
         string boundaryPath,
         CancellationToken cancellationToken)
     {
         var boundaryPrefix = boundaryPath + "/";
-        for (var path = deletedPath[..deletedPath.LastIndexOf('/')];
-             path.StartsWith(boundaryPrefix, StringComparison.Ordinal);
-             path = path[..path.LastIndexOf('/')])
+        var path = deletedPath;
+        while (true)
         {
+            var lastSlash = path.LastIndexOf('/');
+            if (lastSlash < 0)
+            {
+                return;
+            }
+
+            path = path[..lastSlash];
+            if (!path.StartsWith(boundaryPrefix, StringComparison.Ordinal))
+            {
+                return;
+            }
+
             var folder = await TryGetItemAsync(path, cancellationToken);
             if (folder is null)
             {

@@ -462,6 +462,25 @@ public sealed class GraphStoreContractTests : IDisposable
     }
 
     [Theory]
+    [InlineData("")]
+    [InlineData("file.txt")]
+    [InlineData("/")]
+    [InlineData("S3")]
+    [InlineData("S3/bucket")]
+    [InlineData("S3/bucket/file.txt")]
+    public async Task PruneEmptyParents_StopsWithoutGraphRequestsWhenThereIsNoParentBelowTheBoundary(string deletedPath)
+    {
+        var handler = new ListingHandler();
+        var store = CreateStore(handler, handler);
+
+        await store.PruneEmptyParentFoldersAsync(deletedPath, "S3/bucket", CancellationToken.None);
+
+        Assert.Empty(handler.Requests);
+        Assert.True(handler.HasPath("S3"));
+        Assert.True(handler.HasPath("S3/bucket"));
+    }
+
+    [Theory]
     [InlineData("file.txt")]
     [InlineData("backups/file.txt")]
     [InlineData("backups/daily/nested/file.txt")]
