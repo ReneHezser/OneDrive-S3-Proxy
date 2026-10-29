@@ -106,6 +106,24 @@ For example, `backupstore/volumes/backup.blk` in bucket `longhorn` is stored at
 `S3/longhorn/backupstore/volumes/backup.blk` when `OneDrive__RootFolder` is `S3`.
 The proxy creates subfolders as needed; new objects do not use a DataFolder.
 
+Deleting the last object in a folder removes that empty folder and any empty
+ancestors, stopping before the bucket. This applies to single-object deletes,
+multi-object deletes, and `aws s3 rm --recursive`. Object metadata is deleted too;
+empty metadata hash-shard and per-bucket directories below
+`.onedrive-s3-proxy-state/objects` are pruned. The bucket, OneDrive root, state root,
+and active multipart upload state are preserved. Cleanup stops at any remaining
+child, including an empty subfolder; it does not sweep unrelated or previously
+empty directories.
+
+**Avoid concurrent writes during deletion cleanup.** Stop uploads, copies, and
+multipart completions into the affected payload folders, and metadata writes into
+the affected state directories, across all proxy instances and OneDrive clients.
+Folder cleanup checks children and uses conditional deletes, but Graph folder
+ETags do not reliably track child additions: a concurrent new child could be
+deleted with its parent. There is no distributed writer lock. Conflicting or
+entity-tag-mismatched folders are left in place; other Graph errors are returned
+to the caller.
+
 OneDrive file names and paths constrain the accepted S3 keys. New writes reject
 empty path segments, leading/trailing slashes, leading/trailing spaces, trailing
 dots, reserved names, unsupported characters, and paths exceeding 400 characters

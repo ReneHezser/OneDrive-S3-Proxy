@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.8] - 2026-10-29
+
+### Fixed
+
+- Remove empty OneDrive parent folders after deleting the last object, including
+  through recursive or multi-object S3 deletes, without removing the bucket.
+- Remove empty object-metadata hash-shard and per-bucket state folders after
+  deleting metadata, while preserving the state root and active multipart uploads.
+  Cleanup checks for children and uses conditional deletes; writes into the
+  affected payload and metadata directories must be stopped during cleanup.
+
 ## [0.1.7] - 2026-10-28
 
 ### Fixed

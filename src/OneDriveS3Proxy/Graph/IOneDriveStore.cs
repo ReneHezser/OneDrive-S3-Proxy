@@ -21,10 +21,13 @@ public interface IOneDriveStore
     /// <remarks>The caller must dispose the download after consuming its content.</remarks>
     Task<GraphDownload> GetObjectAsync(string bucket, string key, string? range, CancellationToken cancellationToken);
     Task<ObjectInfo> GetObjectInfoAsync(string bucket, string key, CancellationToken cancellationToken);
+    /// <summary>Deletes an object and its state, then removes empty parent folders below the bucket.</summary>
+    /// <remarks>Writers must not target the same payload or metadata subtree during cleanup.</remarks>
     Task DeleteObjectAsync(string bucket, string key, CancellationToken cancellationToken);
     Task<ObjectInfo> CopyObjectAsync(string sourceBucket, string sourceKey, string destinationBucket, string destinationKey, CancellationToken cancellationToken);
     Task<ObjectState> GetObjectStateAsync(string bucket, string key, CancellationToken cancellationToken);
     Task PutObjectStateAsync(string bucket, string key, ObjectState state, CancellationToken cancellationToken);
+    /// <summary>Deletes object metadata and prunes empty shard and bucket folders below the objects state root.</summary>
     Task DeleteObjectStateAsync(string bucket, string key, CancellationToken cancellationToken);
     Task<MultipartUpload> CreateMultipartUploadAsync(string bucket, string key, ObjectState state, CancellationToken cancellationToken);
     /// <summary>Uploads a multipart part from the current position of <paramref name="content"/>.</summary>
