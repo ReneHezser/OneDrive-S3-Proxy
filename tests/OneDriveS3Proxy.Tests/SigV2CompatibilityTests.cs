@@ -65,9 +65,10 @@ public sealed class SigV2CompatibilityTests(LonghornProxyFactory factory) : ICla
     [InlineData("/longhorn/sigv2/caf%C3%A9.txt")]
     public async Task HeaderAuthentication_SupportsEscapedObjectKeys(string path)
     {
-        // TestServer loses some original URI escapes; SigV2 must verify the wire path.
+        // TestServer loses some URI escapes. Configure Kestrel's listener before startup
+        // to avoid the factory's post-build port-assignment race.
         await using var server = new LonghornProxyFactory();
-        server.UseKestrel(0);
+        server.UseKestrel(options => options.Listen(IPAddress.Loopback, 0));
         using var client = server.CreateClient();
         using var putRequest = new HttpRequestMessage(HttpMethod.Put, path)
         {

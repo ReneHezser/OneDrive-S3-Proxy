@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
   current version.
 - Validate all multi-object delete keys before deleting objects, including rejecting
   object entries without a key.
+- Avoid an intermittent Kestrel startup race in escaped-key Signature Version 2
+  compatibility tests by configuring the dynamic loopback listener before startup.
 
 ## [0.1.8] - 2026-10-29
 
