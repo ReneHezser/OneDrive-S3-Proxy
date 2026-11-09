@@ -71,6 +71,9 @@ public sealed class OneDriveStore(
     public async Task<IReadOnlyList<ObjectInfo>> ListObjectsAsync(string bucket, CancellationToken cancellationToken) =>
         (await ListObjectsAsync(bucket, string.Empty, null, cancellationToken)).Objects;
 
+    private static string SanitizeForLog(string value) =>
+        value.Replace("\r", string.Empty).Replace("\n", string.Empty);
+
     public async Task<ObjectListing> ListObjectsAsync(
         string bucket,
         string prefix,
@@ -97,6 +100,10 @@ public sealed class OneDriveStore(
         }
         finally
         {
+            var safeBucket = SanitizeForLog(bucket);
+            var safePrefix = SanitizeForLog(prefix);
+            var safeDelimiter = delimiter is null ? null : SanitizeForLog(delimiter);
+
             // Canceled listings matter most: clients such as Longhorn abort slow listings.
             _logger.Log(
                 outcome == "completed" ? LogLevel.Information : LogLevel.Warning,
@@ -104,9 +111,9 @@ public sealed class OneDriveStore(
                 "{Objects} objects, {CommonPrefixes} common prefixes, {ChildListRequests} Graph child-list requests, " +
                 "{MissingFolders} missing folders tolerated.",
                 outcome,
-                bucket,
-                prefix,
-                delimiter,
+                safeBucket,
+                safePrefix,
+                safeDelimiter,
                 (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds,
                 objectCount,
                 commonPrefixCount,
