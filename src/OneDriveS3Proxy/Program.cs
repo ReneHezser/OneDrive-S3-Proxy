@@ -48,7 +48,8 @@ builder.Services.AddSingleton<IOneDriveStore>(services =>
         clientFactory.CreateClient("MicrosoftGraph"),
         clientFactory,
         services.GetRequiredService<IGraphTokenProvider>(),
-        services.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProxyOptions>>());
+        services.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProxyOptions>>(),
+        services.GetRequiredService<ILogger<OneDriveStore>>());
 });
 builder.Services.AddSingleton<SigV4Verifier>();
 builder.Services.AddSingleton<SigV2Verifier>();

@@ -8,6 +8,7 @@ using System.Xml.Linq;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OneDriveS3Proxy.Graph;
 
@@ -1114,6 +1115,359 @@ public sealed class GraphStoreContractTests : IDisposable
         Assert.Equal(0, handler.ContentDownloads);
     }
 
+    [Theory]
+    [InlineData("", null)]
+    [InlineData("", "/")]
+    [InlineData("logs/", null)]
+    [InlineData("logs/", "/")]
+    [InlineData("logs/nested/", null)]
+    [InlineData("logs/nested/", "/")]
+    public async Task ListObjects_SkipsFoldersDeletedBeforeEnumeration(string prefix, string? delimiter)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "logs/nested/deleted.txt", [1]);
+        handler.AddDirectObject("bucket", "stable.txt", [1]);
+        var deletedPath = prefix == "logs/nested/" ? "S3/bucket/logs/nested" : "S3/bucket/logs";
+        var deleted = false;
+        handler.OverrideResponse = request =>
+        {
+            if (Uri.UnescapeDataString(request.RequestUri!.AbsolutePath)
+                .EndsWith($"/{deletedPath}:/children", StringComparison.Ordinal))
+            {
+                handler.RemovePath(deletedPath);
+                deleted = true;
+            }
+
+            return null;
+        };
+        var store = CreateStore(handler, handler);
+
+        var listing = await store.ListObjectsAsync("bucket", prefix, delimiter, CancellationToken.None);
+
+        Assert.True(deleted);
+        Assert.Equal(prefix.Length == 0 ? ["stable.txt"] : Array.Empty<string>(), listing.Objects.Select(item => item.Key));
+        Assert.Empty(listing.CommonPrefixes);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("/")]
+    public async Task ListObjects_ContinuesAfterNestedFolderDisappears(string? delimiter)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "logs/a-gone/file.txt", [1]);
+        handler.AddDirectObject("bucket", "logs/z-kept/file.txt", [1]);
+        var deleted = false;
+        handler.OverrideResponse = request =>
+        {
+            if (Uri.UnescapeDataString(request.RequestUri!.AbsolutePath)
+                .EndsWith("/S3/bucket/logs/a-gone:/children", StringComparison.Ordinal))
+            {
+                handler.RemovePath("S3/bucket/logs/a-gone");
+                deleted = true;
+            }
+
+            return null;
+        };
+        var store = CreateStore(handler, handler);
+
+        var listing = await store.ListObjectsAsync("bucket", string.Empty, delimiter, CancellationToken.None);
+
+        Assert.True(deleted);
+        Assert.Equal(delimiter is null ? ["logs/z-kept/file.txt"] : Array.Empty<string>(), listing.Objects.Select(item => item.Key));
+        Assert.Equal(delimiter is null ? Array.Empty<string>() : ["logs/"], listing.CommonPrefixes);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("/")]
+    public async Task ListObjects_ToleratesDescendantDeletionBetweenPages(string? delimiter)
+    {
+        var handler = new ListingHandler { PageSize = 1 };
+        if (delimiter is null)
+        {
+            handler.AddDirectObject("bucket", "logs/a.txt", [1]);
+        }
+        else
+        {
+            handler.AddEmptyFolder("bucket", "logs/a-empty");
+        }
+
+        handler.AddDirectObject("bucket", "logs/z.txt", [1]);
+        handler.AddDirectObject("bucket", "a-stable.txt", [1]);
+        var deleted = false;
+        handler.OverrideResponse = request =>
+        {
+            if (Uri.UnescapeDataString(request.RequestUri!.AbsolutePath)
+                .EndsWith("/S3/bucket/logs:/children", StringComparison.Ordinal) &&
+                request.RequestUri.Query.Contains("$skiptoken", StringComparison.Ordinal))
+            {
+                handler.RemovePath("S3/bucket/logs");
+                deleted = true;
+            }
+
+            return null;
+        };
+        var store = CreateStore(handler, handler);
+
+        var listing = await store.ListObjectsAsync("bucket", string.Empty, delimiter, CancellationToken.None);
+
+        Assert.True(deleted);
+        Assert.Equal(delimiter is null ? ["a-stable.txt", "logs/a.txt"] : ["a-stable.txt"], listing.Objects.Select(item => item.Key));
+        Assert.Empty(listing.CommonPrefixes);
+    }
+
+    [Theory]
+    [InlineData(403, null)]
+    [InlineData(403, "/")]
+    [InlineData(429, null)]
+    [InlineData(429, "/")]
+    [InlineData(500, null)]
+    [InlineData(500, "/")]
+    public async Task ListObjects_PropagatesDescendantListingFailures(int statusCode, string? delimiter)
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "logs/file.txt", [1]);
+        handler.OverrideResponse = request =>
+            Uri.UnescapeDataString(request.RequestUri!.AbsolutePath)
+                .EndsWith("/S3/bucket/logs:/children", StringComparison.Ordinal)
+                ? new HttpResponseMessage((HttpStatusCode)statusCode)
+                : null;
+        var store = CreateStore(handler, handler);
+
+        var exception = await Assert.ThrowsAsync<GraphStoreException>(() =>
+            store.ListObjectsAsync("bucket", string.Empty, delimiter, CancellationToken.None));
+
+        Assert.Equal(statusCode, exception.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(404)]
+    [InlineData(403)]
+    [InlineData(429)]
+    [InlineData(500)]
+    public async Task ListObjects_DoesNotHideBucketListingFailures(int statusCode)
+    {
+        var handler = new ListingHandler();
+        handler.OverrideResponse = request =>
+            Uri.UnescapeDataString(request.RequestUri!.AbsolutePath)
+                .EndsWith("/S3/bucket:/children", StringComparison.Ordinal)
+                ? new HttpResponseMessage((HttpStatusCode)statusCode)
+                : null;
+        var store = CreateStore(handler, handler);
+
+        var exception = await Assert.ThrowsAsync<GraphStoreException>(() =>
+            store.ListObjectsAsync("bucket", string.Empty, null, CancellationToken.None));
+
+        Assert.Equal(statusCode, exception.StatusCode);
+    }
+
+    [Fact]
+    public async Task ListObjects_MissingBucketRemainsAnError()
+    {
+        var handler = new ListingHandler();
+        handler.RemovePath("S3/bucket");
+        var store = CreateStore(handler, handler);
+
+        var exception = await Assert.ThrowsAsync<GraphStoreException>(() =>
+            store.ListObjectsAsync("bucket", "logs/", "/", CancellationToken.None));
+
+        Assert.Equal(404, exception.StatusCode);
+        Assert.Equal("NoSuchBucket", exception.S3Code);
+    }
+
+    [Fact]
+    public async Task ListObjects_LogsSummaryWithOutcomeAndGraphRequestCount()
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "backupstore/volumes/aa/bb/pvc/volume.cfg", [1]);
+        var logger = new CapturingLogger<OneDriveStore>();
+        var store = CreateStore(handler, handler, logger);
+
+        await store.ListObjectsAsync("bucket", "backupstore/volumes/", "/", CancellationToken.None);
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Information, entry.Level);
+        Assert.Equal("completed", entry.Properties["Outcome"]);
+        Assert.Equal("bucket", entry.Properties["Bucket"]);
+        Assert.Equal("backupstore/volumes/", entry.Properties["Prefix"]);
+        Assert.Equal("/", entry.Properties["Delimiter"]);
+        Assert.Equal(0, entry.Properties["Objects"]);
+        Assert.Equal(1, entry.Properties["CommonPrefixes"]);
+        Assert.Equal(0, entry.Properties["MissingFolders"]);
+        Assert.Equal(
+            handler.Requests.Count(request => request.Uri.AbsolutePath.EndsWith(":/children", StringComparison.Ordinal)),
+            entry.Properties["ChildListRequests"]);
+        Assert.IsType<long>(entry.Properties["ElapsedMs"]);
+    }
+
+    [Fact]
+    public async Task ListObjects_LogsToleratedMissingFolders()
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "logs/file.txt", [1]);
+        handler.AddDirectObject("bucket", "stable.txt", [1]);
+        handler.OverrideResponse = request =>
+        {
+            if (Uri.UnescapeDataString(request.RequestUri!.AbsolutePath)
+                .EndsWith("/S3/bucket/logs:/children", StringComparison.Ordinal))
+            {
+                handler.RemovePath("S3/bucket/logs");
+            }
+
+            return null;
+        };
+        var logger = new CapturingLogger<OneDriveStore>();
+        var store = CreateStore(handler, handler, logger);
+
+        await store.ListObjectsAsync("bucket", string.Empty, null, CancellationToken.None);
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Information, entry.Level);
+        Assert.Equal("completed", entry.Properties["Outcome"]);
+        Assert.Equal(1, entry.Properties["MissingFolders"]);
+        Assert.Equal(1, entry.Properties["Objects"]);
+    }
+
+    [Fact]
+    public async Task ListObjects_LogsCanceledListingsAsWarnings()
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "logs/file.txt", [1]);
+        using var cancellation = new CancellationTokenSource();
+        handler.OverrideResponse = request =>
+        {
+            if (Uri.UnescapeDataString(request.RequestUri!.AbsolutePath)
+                .EndsWith("/S3/bucket/logs:/children", StringComparison.Ordinal))
+            {
+                cancellation.Cancel();
+                cancellation.Token.ThrowIfCancellationRequested();
+            }
+
+            return null;
+        };
+        var logger = new CapturingLogger<OneDriveStore>();
+        var store = CreateStore(handler, handler, logger);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            store.ListObjectsAsync("bucket", string.Empty, "/", cancellation.Token));
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal("canceled", entry.Properties["Outcome"]);
+        Assert.Equal(2, entry.Properties["ChildListRequests"]);
+    }
+
+    [Fact]
+    public async Task ListObjects_LogsFailedListingsAsWarnings()
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "logs/file.txt", [1]);
+        handler.OverrideResponse = request =>
+            Uri.UnescapeDataString(request.RequestUri!.AbsolutePath)
+                .EndsWith("/S3/bucket/logs:/children", StringComparison.Ordinal)
+                ? new HttpResponseMessage(HttpStatusCode.Forbidden)
+                : null;
+        var logger = new CapturingLogger<OneDriveStore>();
+        var store = CreateStore(handler, handler, logger);
+
+        await Assert.ThrowsAsync<GraphStoreException>(() =>
+            store.ListObjectsAsync("bucket", string.Empty, "/", CancellationToken.None));
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal("failed", entry.Properties["Outcome"]);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(256)]
+    public async Task ListObjects_LonghornVolumeListingDoesNotScanBlocksWhenConfigIsOnTheSamePage(int emptyShards)
+    {
+        var handler = new ListingHandler();
+        for (var index = 0; index < emptyShards; index++)
+        {
+            handler.AddEmptyFolder("bucket", $"backupstore/volumes/aa/bb/pvc/blocks/{index:x4}");
+        }
+
+        handler.AddEmptyFolder("bucket", "backupstore/volumes/aa/bb/pvc/blocks");
+        handler.AddDirectObject("bucket", "backupstore/volumes/aa/bb/pvc/volume.cfg", [1]);
+        var store = CreateStore(handler, handler);
+
+        var listing = await store.ListObjectsAsync("bucket", "backupstore/volumes/", "/", CancellationToken.None);
+
+        Assert.Empty(listing.Objects);
+        Assert.Equal(["backupstore/volumes/aa/"], listing.CommonPrefixes);
+        Assert.Equal(4, handler.Requests.Count(request => request.Uri.AbsolutePath.EndsWith(":/children", StringComparison.Ordinal)));
+        Assert.DoesNotContain(handler.Requests, request => request.Uri.AbsolutePath.Contains("/blocks", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Requests, request => request.Uri.AbsolutePath.Contains(".onedrive-s3-proxy-state", StringComparison.Ordinal));
+        Assert.Equal(0, handler.ContentDownloads);
+    }
+
+    [Fact]
+    public async Task ListObjects_ProbesCommonPrefixesConcurrentlyWithinTheConfiguredLimit()
+    {
+        var handler = new ListingHandler { ChildrenDelay = TimeSpan.FromMilliseconds(50) };
+        for (var index = 0; index < 8; index++)
+        {
+            handler.AddDirectObject("bucket", $"volumes/v{index}/volume.cfg", [1]);
+        }
+
+        var store = CreateStore(handler, handler);
+
+        var listing = await store.ListObjectsAsync("bucket", "volumes/", "/", CancellationToken.None);
+
+        Assert.Equal(Enumerable.Range(0, 8).Select(index => $"volumes/v{index}/"), listing.CommonPrefixes);
+        Assert.InRange(handler.MaxChildrenInFlight, 2, new OneDriveOptions().MaxConcurrency);
+    }
+
+    [Fact]
+    public async Task ListObjects_StopsProbingAPrefixGroupAfterItsFirstNonEmptyFolder()
+    {
+        var handler = new ListingHandler();
+        handler.AddDirectObject("bucket", "logs/v1--alpha/a.txt", [1]);
+        handler.AddDirectObject("bucket", "logs/v1--beta/b.txt", [1]);
+        var store = CreateStore(handler, handler);
+
+        var listing = await store.ListObjectsAsync("bucket", "logs/v1", "--", CancellationToken.None);
+
+        Assert.Equal(["logs/v1--"], listing.CommonPrefixes);
+        Assert.Contains(handler.Requests, request => request.Uri.AbsolutePath.Contains("v1--alpha", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Requests, request => request.Uri.AbsolutePath.Contains("v1--beta", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ListObjects_ProbesFoldersReportingChildrenBeforeEmptyOnes()
+    {
+        var handler = new ListingHandler();
+        for (var index = 0; index < 50; index++)
+        {
+            handler.AddEmptyFolder("bucket", $"logs/e{index:D2}");
+        }
+
+        handler.AddDirectObject("bucket", "logs/zz/data.txt", [1]);
+        var store = CreateStore(handler, handler);
+
+        var listing = await store.ListObjectsAsync("bucket", string.Empty, "/", CancellationToken.None);
+
+        Assert.Equal(["logs/"], listing.CommonPrefixes);
+        Assert.Equal(3, handler.Requests.Count(request => request.Uri.AbsolutePath.EndsWith(":/children", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task ListObjects_DoesNotSkipFoldersThatReportNoChildren()
+    {
+        var handler = new ListingHandler { ReportEmptyFolders = true };
+        handler.AddDirectObject("bucket", "logs/a/file.txt", [1]);
+        var store = CreateStore(handler, handler);
+
+        var grouped = await store.ListObjectsAsync("bucket", string.Empty, "/", CancellationToken.None);
+        var recursive = await store.ListObjectsAsync("bucket", string.Empty, null, CancellationToken.None);
+
+        Assert.Equal(["logs/"], grouped.CommonPrefixes);
+        Assert.Equal(["logs/a/file.txt"], recursive.Objects.Select(item => item.Key));
+    }
+
     [Fact]
     public async Task PutObjectState_RetriesTransientGraphFailures()
     {
@@ -1200,7 +1554,8 @@ public sealed class GraphStoreContractTests : IDisposable
 
     private OneDriveStore CreateStore(
         HttpMessageHandler graphHandler,
-        HttpMessageHandler monitorHandler)
+        HttpMessageHandler monitorHandler,
+        ILogger<OneDriveStore>? logger = null)
     {
         var graphClient = new HttpClient(graphHandler)
         {
@@ -1232,7 +1587,47 @@ public sealed class GraphStoreContractTests : IDisposable
                     SecretKey = "secret",
                     Region = "us-east-1"
                 }
-            }));
+            }),
+            logger);
+    }
+
+    private sealed record LogEntry(LogLevel Level, Dictionary<string, object?> Properties);
+
+    private sealed class CapturingLogger<T> : ILogger<T>
+    {
+        private readonly object _lock = new();
+        private readonly List<LogEntry> _entries = [];
+
+        public IReadOnlyList<LogEntry> Entries
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _entries.ToArray();
+                }
+            }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var properties = state is IEnumerable<KeyValuePair<string, object?>> pairs
+                ? pairs.ToDictionary(pair => pair.Key, pair => pair.Value)
+                : [];
+            lock (_lock)
+            {
+                _entries.Add(new LogEntry(logLevel, properties));
+            }
+        }
     }
 
     private sealed class UploadTestStream(byte[] content, bool seekable) : Stream
@@ -1547,6 +1942,8 @@ public sealed class GraphStoreContractTests : IDisposable
         private readonly ConcurrentDictionary<string, (bool IsFolder, byte[]? Content, long Size)> _items = new();
         private readonly ConcurrentDictionary<string, (string Path, MemoryStream Content)> _uploads = new();
         private int _contentDownloads;
+        private int _childrenInFlight;
+        private int _maxChildrenInFlight;
 
         public ListingHandler()
         {
@@ -1556,6 +1953,9 @@ public sealed class GraphStoreContractTests : IDisposable
 
         public int ContentDownloads => _contentDownloads;
         public int PageSize { get; init; } = int.MaxValue;
+        public TimeSpan ChildrenDelay { get; init; }
+        public bool ReportEmptyFolders { get; init; }
+        public int MaxChildrenInFlight => Volatile.Read(ref _maxChildrenInFlight);
         public int UploadSessions { get; private set; }
         public int StateWriteFailures { get; set; }
         public Action? BeforeUpload { get; set; }
@@ -1675,6 +2075,19 @@ public sealed class GraphStoreContractTests : IDisposable
                     return Json(HttpStatusCode.Created, Describe(path, _items[path]));
                 }
 
+                if (ChildrenDelay > TimeSpan.Zero)
+                {
+                    RecordMaximum(ref _maxChildrenInFlight, Interlocked.Increment(ref _childrenInFlight));
+                    try
+                    {
+                        await Task.Delay(ChildrenDelay, cancellationToken);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _childrenInFlight);
+                    }
+                }
+
                 return Children(parent, request.RequestUri);
             }
 
@@ -1772,6 +2185,15 @@ public sealed class GraphStoreContractTests : IDisposable
         private string? FindPath(string path) =>
             _items.Keys.FirstOrDefault(candidate => candidate.Equals(path, StringComparison.OrdinalIgnoreCase));
 
+        private static void RecordMaximum(ref int maximum, int value)
+        {
+            int current;
+            while (value > (current = Volatile.Read(ref maximum)) &&
+                   Interlocked.CompareExchange(ref maximum, value, current) != current)
+            {
+            }
+        }
+
         private void AddFile(string path, byte[]? content, long size)
         {
             var segments = path.Split('/');
@@ -1825,7 +2247,7 @@ public sealed class GraphStoreContractTests : IDisposable
                     lastModifiedDateTime = DateTimeOffset.UtcNow,
                     folder = (object?)new
                     {
-                        childCount = _items.Keys.Count(candidate =>
+                        childCount = ReportEmptyFolders ? 0 : _items.Keys.Count(candidate =>
                             candidate.StartsWith(path + "/", StringComparison.Ordinal) &&
                             !candidate[(path.Length + 1)..].Contains('/'))
                     }
