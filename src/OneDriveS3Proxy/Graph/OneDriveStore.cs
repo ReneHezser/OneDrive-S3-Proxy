@@ -1,9 +1,11 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace OneDriveS3Proxy.Graph;
@@ -12,7 +14,8 @@ public sealed class OneDriveStore(
     HttpClient httpClient,
     IHttpClientFactory httpClientFactory,
     IGraphTokenProvider tokenProvider,
-    IOptions<ProxyOptions> options) : IOneDriveStore
+    IOptions<ProxyOptions> options,
+    ILogger<OneDriveStore>? logger = null) : IOneDriveStore
 {
     private const string StateFolder = ".onedrive-s3-proxy-state";
     private const int SimpleUploadLimit = 4 * 1024 * 1024;
@@ -21,6 +24,7 @@ public sealed class OneDriveStore(
     private const int StateWriteAttempts = 3;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly ProxyOptions _options = options.Value;
+    private readonly ILogger _logger = logger ?? NullLogger<OneDriveStore>.Instance;
     private readonly HttpClient _monitorClient = httpClientFactory.CreateClient("GraphMonitor");
     private readonly SemaphoreSlim _rootLock = new(1, 1);
     private readonly SemaphoreSlim _readinessLock = new(1, 1);
@@ -67,10 +71,62 @@ public sealed class OneDriveStore(
     public async Task<IReadOnlyList<ObjectInfo>> ListObjectsAsync(string bucket, CancellationToken cancellationToken) =>
         (await ListObjectsAsync(bucket, string.Empty, null, cancellationToken)).Objects;
 
+    private static string SanitizeForLog(string value) =>
+        value.Replace("\r", string.Empty).Replace("\n", string.Empty);
+
     public async Task<ObjectListing> ListObjectsAsync(
         string bucket,
         string prefix,
         string? delimiter,
+        CancellationToken cancellationToken)
+    {
+        var stats = new ListingStats();
+        var started = Stopwatch.GetTimestamp();
+        var outcome = "failed";
+        var objectCount = 0;
+        var commonPrefixCount = 0;
+        try
+        {
+            var listing = await ListObjectsCoreAsync(bucket, prefix, delimiter, stats, cancellationToken);
+            outcome = "completed";
+            objectCount = listing.Objects.Count;
+            commonPrefixCount = listing.CommonPrefixes.Count;
+            return listing;
+        }
+        catch (OperationCanceledException)
+        {
+            outcome = "canceled";
+            throw;
+        }
+        finally
+        {
+            var safeBucket = SanitizeForLog(bucket);
+            var safePrefix = SanitizeForLog(prefix);
+            var safeDelimiter = delimiter is null ? null : SanitizeForLog(delimiter);
+
+            // Canceled listings matter most: clients such as Longhorn abort slow listings.
+            _logger.Log(
+                outcome == "completed" ? LogLevel.Information : LogLevel.Warning,
+                "Listing {Outcome} for bucket {Bucket}, prefix {Prefix}, delimiter {Delimiter} after {ElapsedMs} ms: " +
+                "{Objects} objects, {CommonPrefixes} common prefixes, {ChildListRequests} Graph child-list requests, " +
+                "{MissingFolders} missing folders tolerated.",
+                outcome,
+                safeBucket,
+                safePrefix,
+                safeDelimiter,
+                (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                objectCount,
+                commonPrefixCount,
+                stats.ChildListRequests,
+                stats.MissingFolders);
+        }
+    }
+
+    private async Task<ObjectListing> ListObjectsCoreAsync(
+        string bucket,
+        string prefix,
+        string? delimiter,
+        ListingStats stats,
         CancellationToken cancellationToken)
     {
         if (!await BucketExistsAsync(bucket, cancellationToken))
@@ -80,7 +136,9 @@ public sealed class OneDriveStore(
 
         var results = new Dictionary<string, DriveItem>(StringComparer.Ordinal);
         var commonPrefixes = new SortedSet<string>(StringComparer.Ordinal);
+        var prefixCandidates = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         var folders = new Queue<(string Path, string Prefix)>();
+        var bucketPath = BucketPath(bucket);
         var slash = prefix.LastIndexOf('/');
         if (slash >= 0)
         {
@@ -95,12 +153,13 @@ public sealed class OneDriveStore(
         }
         else
         {
-            folders.Enqueue((BucketPath(bucket), string.Empty));
+            folders.Enqueue((bucketPath, string.Empty));
         }
 
         while (folders.TryDequeue(out var folder))
         {
-            await foreach (var item in EnumerateChildrenAsync(folder.Path, cancellationToken))
+            await foreach (var item in EnumerateChildrenAsync(
+                folder.Path, cancellationToken, ignoreMissing: folder.Path != bucketPath, stats))
             {
                 var key = string.IsNullOrEmpty(folder.Prefix) ? item.Name : $"{folder.Prefix}/{item.Name}";
                 if (item.Folder is not null)
@@ -118,12 +177,12 @@ public sealed class OneDriveStore(
                     if (index >= 0)
                     {
                         var commonPrefix = folderPrefix[..(index + delimiter!.Length)];
-                        if (!commonPrefixes.Contains(commonPrefix) &&
-                            await ContainsObjectsAsync($"{folder.Path}/{item.Name}", cancellationToken))
+                        if (!prefixCandidates.TryGetValue(commonPrefix, out var candidatePaths))
                         {
-                            commonPrefixes.Add(commonPrefix);
+                            prefixCandidates[commonPrefix] = candidatePaths = [];
                         }
 
+                        candidatePaths.Add($"{folder.Path}/{item.Name}");
                         continue;
                     }
 
@@ -146,6 +205,12 @@ public sealed class OneDriveStore(
             }
         }
 
+        foreach (var commonPrefix in await FindNonEmptyPrefixesAsync(
+            prefixCandidates, commonPrefixes, stats, cancellationToken))
+        {
+            commonPrefixes.Add(commonPrefix);
+        }
+
         var keys = results.Keys.OrderBy(key => key, StringComparer.Ordinal).ToArray();
         var objects = new ObjectInfo[keys.Length];
         await Parallel.ForAsync(0, keys.Length, new ParallelOptions
@@ -162,12 +227,41 @@ public sealed class OneDriveStore(
             commonPrefixes.ToList());
     }
 
-    private async Task<bool> ContainsObjectsAsync(string path, CancellationToken cancellationToken)
+    // Each probe is a sequential depth-first search, so distinct prefixes run concurrently. The Graph request
+    // coordinator still bounds outbound requests; probes within one prefix group stop at the first match.
+    private async Task<List<string>> FindNonEmptyPrefixesAsync(
+        Dictionary<string, List<string>> candidates,
+        SortedSet<string> known,
+        ListingStats stats,
+        CancellationToken cancellationToken)
     {
-        await foreach (var item in EnumerateChildrenAsync(path, cancellationToken))
+        var pending = candidates.Where(candidate => !known.Contains(candidate.Key)).ToArray();
+        var nonEmpty = new bool[pending.Length];
+        await Parallel.ForAsync(0, pending.Length, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = _options.OneDrive.MaxConcurrency,
+            CancellationToken = cancellationToken
+        }, async (index, token) =>
+        {
+            foreach (var path in pending[index].Value)
+            {
+                if (await ContainsObjectsAsync(path, token, stats))
+                {
+                    nonEmpty[index] = true;
+                    return;
+                }
+            }
+        });
+
+        return pending.Where((_, index) => nonEmpty[index]).Select(candidate => candidate.Key).ToList();
+    }
+
+    private async Task<bool> ContainsObjectsAsync(string path, CancellationToken cancellationToken, ListingStats stats)
+    {
+        await foreach (var item in EnumerateChildrenAsync(path, cancellationToken, ignoreMissing: true, stats))
         {
             if (item.Folder is null ||
-                await ContainsObjectsAsync($"{path}/{item.Name}", cancellationToken))
+                await ContainsObjectsAsync($"{path}/{item.Name}", cancellationToken, stats))
             {
                 return true;
             }
@@ -893,16 +987,30 @@ public sealed class OneDriveStore(
 
     private async IAsyncEnumerable<DriveItem> EnumerateChildrenAsync(
         string path,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        [EnumeratorCancellation] CancellationToken cancellationToken,
+        bool ignoreMissing = false,
+        ListingStats? stats = null)
     {
         string? next = $"{ItemPath(path)}:/children?$select=id,name,size,eTag,createdDateTime,lastModifiedDateTime,folder&$top=200";
         while (next is not null)
         {
+            stats?.CountChildListRequest();
             using var response = await SendAsync(HttpMethod.Get, next, null, cancellationToken);
+            if (ignoreMissing && response.StatusCode == HttpStatusCode.NotFound)
+            {
+                // Deletion cleanup can remove a listed descendant before this or a later page is read.
+                stats?.CountMissingFolder();
+                yield break;
+            }
+
             await EnsureSuccessAsync(response, cancellationToken);
             var page = await response.Content.ReadFromJsonAsync<DriveItemCollection>(cancellationToken)
                 ?? throw new GraphStoreException(502, "Microsoft Graph returned an empty collection response.");
-            foreach (var item in page.Value)
+            // A file proves a subtree nonempty without descending. Folders reporting no children go last,
+            // but are never skipped: Graph child counts can lag behind recent writes.
+            foreach (var item in page.Value
+                .OrderBy(item => item.Folder is not null)
+                .ThenBy(item => item.Folder is { ChildCount: 0 }))
             {
                 yield return item;
             }
@@ -1231,6 +1339,18 @@ public sealed class OneDriveStore(
         return state.ETag is not null && state.StorageETag == item.ETag
             ? info with { ETag = state.ETag }
             : info;
+    }
+
+    private sealed class ListingStats
+    {
+        private int _childListRequests;
+        private int _missingFolders;
+
+        public int ChildListRequests => Volatile.Read(ref _childListRequests);
+        public int MissingFolders => Volatile.Read(ref _missingFolders);
+
+        public void CountChildListRequest() => Interlocked.Increment(ref _childListRequests);
+        public void CountMissingFolder() => Interlocked.Increment(ref _missingFolders);
     }
 
     private static ObjectInfo ToObjectInfo(string key, DriveItem item) =>

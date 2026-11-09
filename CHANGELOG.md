@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.10] - 2026-11-09
+
+### Fixed
+
+- Tolerate descendant folders disappearing during object listings, including
+  between Graph result pages, while concurrent deletion prunes empty folders.
+  Missing buckets, cancellation, and other Graph errors remain failures.
+- Inspect files before folders within each Graph page, and folders that report no
+  children last, avoiding unnecessary Longhorn block-directory scans when a volume
+  config file already establishes that a grouped prefix is nonempty. Folders are never
+  skipped based on Graph child counts, and listings remain uncached.
+
+### Changed
+
+- Probe distinct delimiter common prefixes concurrently, bounded by
+  `OneDrive__MaxConcurrency`, to shorten large Longhorn backup-volume listings.
+- Log one summary line per object listing with its outcome, duration, result counts,
+  Graph child-list request count, and tolerated missing folders. Canceled and failed
+  listings are logged as warnings.
+- Default the `System.Net.Http.HttpClient` log category to `Warning`, so Graph requests
+  are no longer logged per call. Set `Logging__LogLevel__System.Net.Http.HttpClient` to
+  `Information` to restore the previous output.
+
 ## [0.1.9] - 2026-10-29
 
 ### Fixed

@@ -153,6 +153,12 @@ ASP.NET Core maps double underscores in environment variables to configuration s
 | `S3__SecretKey` | Long random signing secret |
 | `S3__Region` | SigV4 region; default `us-east-1` |
 | `S3__MaxUploadSizeMiB` | Upload limit from 1 through 238000; default `238000` |
+| `Logging__LogLevel__System.Net.Http.HttpClient` | Log level for outbound Graph HTTP client logs; default `Warning`. Set `Information` to log every Graph request (about four lines each, including the user's UPN in the URL), which can rotate container logs within seconds. |
+
+Each object listing logs one summary line with its outcome (`completed`, `canceled`, or
+`failed`), duration, object and common-prefix counts, the number of Graph child-list
+requests, and how many missing folders were tolerated. Canceled and failed listings are
+logged as warnings, so clients that abort slow listings, such as Longhorn, remain visible.
 
 ## OneDrive storage layout
 
@@ -169,6 +175,11 @@ empty metadata hash-shard and per-bucket directories below
 and active multipart upload state are preserved. Cleanup stops at any remaining
 child, including an empty subfolder; it does not sweep unrelated or previously
 empty directories.
+
+Listings tolerate descendant folders disappearing during deletion cleanup, including
+between Graph result pages. They are not atomic snapshots: objects read before a
+concurrent deletion may still appear in the response. Missing buckets and Graph
+errors other than a missing descendant are still returned as errors.
 
 **Avoid concurrent writes during deletion cleanup.** Stop uploads, copies, and
 multipart completions into the affected payload folders, and metadata writes into
@@ -413,8 +424,15 @@ supported within the configured object-size limit. Object listing resolves the f
 portion of the requested prefix directly and traverses only matching branches, so listing
 system backups does not scan unrelated volume-block directories. Delimiter listings
 stop searching a grouped subtree after finding one file; empty folders are not exposed
-as S3 common prefixes. Listings still require live Graph requests, and broad listings or
-sustained Microsoft Graph throttling can still exceed a client's timeout.
+as S3 common prefixes. Files are inspected before folders within each Graph page,
+so a volume's config file can establish that a group is nonempty without scanning
+its block directories; folders that report no children are searched last but never
+skipped, because Graph child counts can lag behind recent writes. Distinct common
+prefixes are probed concurrently, up to `OneDrive__MaxConcurrency` at a time, and
+probing stops within a prefix at its first nonempty folder. This does not prefetch
+later Graph pages or cache listings. Listings still require live Graph requests, and
+broad listings or sustained Microsoft Graph throttling can still exceed a client's
+timeout.
 
 References:
 
