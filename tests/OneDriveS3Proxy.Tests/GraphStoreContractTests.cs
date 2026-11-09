@@ -1379,6 +1379,30 @@ public sealed class GraphStoreContractTests : IDisposable
         Assert.Equal("failed", entry.Properties["Outcome"]);
     }
 
+    [Fact]
+    public async Task ListObjects_LogsRequestValuesWithoutLineBreaks()
+    {
+        var handler = new ListingHandler();
+        var logger = new CapturingLogger<OneDriveStore>();
+        var store = CreateStore(handler, handler, logger);
+
+        await store.ListObjectsAsync("bucket", "logs\r\nforged entry/", "/\n", CancellationToken.None);
+        await Assert.ThrowsAsync<GraphStoreException>(() =>
+            store.ListObjectsAsync("bu\r\ncket", string.Empty, null, CancellationToken.None));
+
+        Assert.Equal(2, logger.Entries.Count);
+        Assert.Equal("logsforged entry/", logger.Entries[0].Properties["Prefix"]);
+        foreach (var entry in logger.Entries)
+        {
+            foreach (var name in new[] { "Bucket", "Prefix", "Delimiter" })
+            {
+                var value = (string?)entry.Properties[name] ?? string.Empty;
+                Assert.DoesNotContain('\r', value);
+                Assert.DoesNotContain('\n', value);
+            }
+        }
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(256)]
