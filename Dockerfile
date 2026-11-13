@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:11.0 AS build
 WORKDIR /src
 COPY src/OneDriveS3Proxy/OneDriveS3Proxy.csproj src/OneDriveS3Proxy/
 RUN dotnet restore src/OneDriveS3Proxy/OneDriveS3Proxy.csproj
@@ -9,7 +9,7 @@ RUN dotnet publish src/OneDriveS3Proxy/OneDriveS3Proxy.csproj \
     --no-restore \
     /p:UseAppHost=false
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine AS final
+FROM mcr.microsoft.com/dotnet/aspnet:11.0-alpine AS final
 WORKDIR /app
 ENV ASPNETCORE_HTTP_PORTS="" \
     S3__URL=http://+:9000
