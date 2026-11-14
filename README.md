@@ -454,6 +454,70 @@ kubectl delete -f .\k8s\s3manager-test.yaml
 
 Reference: [cloudlena/s3manager](https://github.com/cloudlena/s3manager)
 
+## Local performance test
+
+The local runner starts the real proxy on an ephemeral loopback Kestrel port and
+replaces only `IOneDriveStore` with a streaming simulation. No Entra/S3 credentials,
+running proxy, or OneDrive access are needed. It measures single-part signed PUTs
+and full GETs over HTTP/1.1, including server-side SHA-256 validation, streamed MD5
+ETags, and client-side download length/SHA-256 verification.
+
+With the .NET 10 SDK installed, run from the repository root:
+
+```powershell
+dotnet run --configuration Release --project .\tests\OneDriveS3Proxy.Performance
+```
+
+Defaults match the workload of 32 objects at each combination of **1, 16, and
+1024 MiB** and **1, 2, 4, 8, and 16 concurrent files**. Uploads complete before the
+download phase for each combination. The full sweep transfers about **325 GiB**
+over loopback, took about 9 minutes of measured transfer time on a 10-core Arm64
+machine, and can put sustained load on it. Run it on an idle machine and repeat runs
+before comparing results.
+
+For a quick smoke test or a custom workload:
+
+```powershell
+dotnet run --configuration Release --project .\tests\OneDriveS3Proxy.Performance -- `
+  --sizes-mib 1,16 --concurrency 1,4 --objects 8 `
+  --timeout-seconds 600 --output .\artifacts\performance\smoke.json
+```
+
+The table and JSON report show per-phase successful MiB/s, files/s, p50/p95/p99
+whole-request latency, failures, skipped downloads, and observed peak client/server
+in-flight requests. Throughput divides successfully verified bytes by the whole
+phase's wall time, including failed attempts. Latencies use nearest-rank percentiles
+of successful requests (p99 equals the slowest request when fewer than 100 succeed,
+as with the default 32 objects); they are null if none succeed. Downloads are attempted
+only for successful uploads. Any failed request, including a failed ETag, length, or
+SHA-256 check, is recorded and produces a nonzero exit code.
+
+Interpret results with these limits in mind. Phases for small objects can finish in
+tens of milliseconds (32 x 1 MiB), so their throughput is dominated by timing noise;
+raise `--objects` for them. The client and server share one process and CPU: when
+`CombinedProcessCpuPercent` in the JSON report approaches 100, the figure shows this
+machine's ceiling rather than how the proxy scales. Sub-second phases varied by up to
+3x between identical runs (uploads more than downloads), so compare medians of several
+runs, not single numbers.
+
+JSON reports default to timestamped files under `artifacts/performance/` and include
+the workload, runtime/OS/architecture, combined client/server CPU utilization
+(normalized to all logical processors), and process-wide peak working set.
+Hash preparation, warmup, and descriptor cleanup are outside measured phases.
+Each request's timeout covers response headers **and** the complete streamed body.
+Use Ctrl+C to cancel; canceled runs do not produce a complete report.
+
+Payloads use a deterministic repeating 64 KiB block. The simulated store consumes
+and validates uploads, retains only object descriptors/metadata, and regenerates
+downloads; it never allocates a complete object or writes its contents to disk.
+The client and server share a process and CPU/memory resources. These results
+therefore measure the local HTTP/authentication/streaming pipeline, **not production
+OneDrive throughput**: Graph networking, upload sessions, disk I/O, throttling,
+retries, multi-replica behavior, and multipart operations are excluded.
+`OneDrive__MaxConcurrency` limits Graph requests and has no effect on this simulated
+backend. Peak in-flight requests indicate overlap, not CPU threads or Graph
+parallelism.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

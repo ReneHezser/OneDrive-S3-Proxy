@@ -23,6 +23,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\OneDriveS3Proxy\OneDriveS3Proxy.csproj" />
+    <ProjectReference Include="..\OneDriveS3Proxy.Performance\OneDriveS3Proxy.Performance.csproj" />
   </ItemGroup>
 
 </Project>

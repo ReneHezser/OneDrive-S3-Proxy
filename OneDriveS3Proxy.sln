@@ -9,6 +9,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OneDriveS3Proxy", "src\OneD
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OneDriveS3Proxy.Tests", "tests\OneDriveS3Proxy.Tests\OneDriveS3Proxy.Tests.csproj", "{78EEC44E-7C70-4F51-B869-BDAC67E9B487}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OneDriveS3Proxy.Performance", "tests\OneDriveS3Proxy.Performance\OneDriveS3Proxy.Performance.csproj", "{CCE062D4-E355-438A-A1DB-BA8BF80506A0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -43,6 +47,18 @@ Global
 		{78EEC44E-7C70-4F51-B869-BDAC67E9B487}.Release|x64.Build.0 = Release|Any CPU
 		{78EEC44E-7C70-4F51-B869-BDAC67E9B487}.Release|x86.ActiveCfg = Release|Any CPU
 		{78EEC44E-7C70-4F51-B869-BDAC67E9B487}.Release|x86.Build.0 = Release|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Debug|x64.Build.0 = Debug|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Debug|x86.Build.0 = Debug|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Release|x64.ActiveCfg = Release|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Release|x64.Build.0 = Release|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Release|x86.ActiveCfg = Release|Any CPU
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -50,5 +66,6 @@ Global
 	GlobalSection(NestedProjects) = preSolution
 		{23F496C3-09BC-4091-B146-6C242ED876FF} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{78EEC44E-7C70-4F51-B869-BDAC67E9B487} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{CCE062D4-E355-438A-A1DB-BA8BF80506A0} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 EndGlobal
